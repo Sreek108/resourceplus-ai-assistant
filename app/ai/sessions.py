@@ -1,0 +1,246 @@
+from __future__ import annotations
+
+from copy import deepcopy
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from threading import RLock
+from typing import Callable, Protocol
+from uuid import uuid4
+
+from app.config import get_settings
+
+
+HistoryItem = dict[str, str]
+
+
+@dataclass(frozen=True)
+class PendingAction:
+    confirmation_id: str
+    action_type: str
+    validated_arguments: dict[str, object]
+    summary: str
+    language: str
+    created_at: datetime
+    expires_at: datetime
+
+
+@dataclass
+class _SessionState:
+    session_id: str
+    history: list[HistoryItem] = field(default_factory=list)
+    pending_action: PendingAction | None = None
+    expired_pending_language: str | None = None
+    expired_pending_action_type: str | None = None
+    updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class PendingActionExpired(Exception):
+    pass
+
+
+class PendingActionMismatch(Exception):
+    pass
+
+
+class SessionStore(Protocol):
+    def ensure_session(self, session_id: str | None = None) -> str: ...
+
+    def create_pending_action(
+        self,
+        session_id: str,
+        *,
+        action_type: str,
+        validated_arguments: dict[str, object],
+        summary: str,
+        language: str,
+    ) -> PendingAction: ...
+
+    def get_pending_action(
+        self,
+        session_id: str,
+    ) -> tuple[PendingAction | None, bool]: ...
+
+    def get_expired_pending_language(self, session_id: str) -> str | None: ...
+
+    def get_expired_pending_action_type(self, session_id: str) -> str | None: ...
+
+    def consume_pending_action(
+        self,
+        session_id: str,
+        confirmation_id: str | None = None,
+    ) -> PendingAction: ...
+
+    def discard_pending_action(self, session_id: str) -> PendingAction | None: ...
+
+    def get_history(self, session_id: str) -> list[HistoryItem]: ...
+
+    def append_history(self, session_id: str, role: str, content: str) -> None: ...
+
+
+class InMemorySessionStore:
+    """Replaceable, process-local session and confirmation storage for the demo."""
+
+    def __init__(
+        self,
+        *,
+        confirmation_ttl_seconds: int = 300,
+        session_ttl_seconds: int = 1_800,
+        now: Callable[[], datetime] | None = None,
+        history_limit: int = 12,
+    ) -> None:
+        self.confirmation_ttl = timedelta(seconds=confirmation_ttl_seconds)
+        self.session_ttl = timedelta(seconds=session_ttl_seconds)
+        self._now = now or (lambda: datetime.now(timezone.utc))
+        self.history_limit = history_limit
+        self._sessions: dict[str, _SessionState] = {}
+        self._lock = RLock()
+
+    @staticmethod
+    def _clone_action(action: PendingAction) -> PendingAction:
+        return PendingAction(
+            confirmation_id=action.confirmation_id,
+            action_type=action.action_type,
+            validated_arguments=deepcopy(action.validated_arguments),
+            summary=action.summary,
+            language=action.language,
+            created_at=action.created_at,
+            expires_at=action.expires_at,
+        )
+
+    def _remove_stale_sessions(self, current: datetime) -> None:
+        stale = [
+            session_id
+            for session_id, state in self._sessions.items()
+            if current - state.updated_at > self.session_ttl
+        ]
+        for session_id in stale:
+            self._sessions.pop(session_id, None)
+
+    def ensure_session(self, session_id: str | None = None) -> str:
+        with self._lock:
+            current = self._now()
+            self._remove_stale_sessions(current)
+            resolved = session_id or str(uuid4())
+            state = self._sessions.get(resolved)
+            if state is None:
+                state = _SessionState(session_id=resolved, updated_at=current)
+                self._sessions[resolved] = state
+            else:
+                state.updated_at = current
+            return resolved
+
+    def create_pending_action(
+        self,
+        session_id: str,
+        *,
+        action_type: str,
+        validated_arguments: dict[str, object],
+        summary: str,
+        language: str,
+    ) -> PendingAction:
+        with self._lock:
+            self.ensure_session(session_id)
+            current = self._now()
+            action = PendingAction(
+                confirmation_id=str(uuid4()),
+                action_type=action_type,
+                validated_arguments=deepcopy(validated_arguments),
+                summary=summary,
+                language=language,
+                created_at=current,
+                expires_at=current + self.confirmation_ttl,
+            )
+            state = self._sessions[session_id]
+            state.pending_action = action
+            state.expired_pending_language = None
+            state.expired_pending_action_type = None
+            state.updated_at = current
+            return self._clone_action(action)
+
+    def get_pending_action(
+        self,
+        session_id: str,
+    ) -> tuple[PendingAction | None, bool]:
+        """Return (action, expired). Expired actions are discarded immediately."""
+
+        with self._lock:
+            state = self._sessions.get(session_id)
+            if state is None or state.pending_action is None:
+                return None, False
+            current = self._now()
+            if current >= state.pending_action.expires_at:
+                state.expired_pending_language = state.pending_action.language
+                state.expired_pending_action_type = state.pending_action.action_type
+                state.pending_action = None
+                state.updated_at = current
+                return None, True
+            return self._clone_action(state.pending_action), False
+
+    def get_expired_pending_language(self, session_id: str) -> str | None:
+        with self._lock:
+            state = self._sessions.get(session_id)
+            return state.expired_pending_language if state else None
+
+    def get_expired_pending_action_type(self, session_id: str) -> str | None:
+        with self._lock:
+            state = self._sessions.get(session_id)
+            return state.expired_pending_action_type if state else None
+
+    def consume_pending_action(
+        self,
+        session_id: str,
+        confirmation_id: str | None = None,
+    ) -> PendingAction:
+        with self._lock:
+            state = self._sessions.get(session_id)
+            if state is None or state.pending_action is None:
+                raise PendingActionMismatch("There is no pending action to confirm.")
+            current = self._now()
+            action = state.pending_action
+            if current >= action.expires_at:
+                state.pending_action = None
+                state.updated_at = current
+                raise PendingActionExpired("The pending confirmation has expired.")
+            if confirmation_id and confirmation_id != action.confirmation_id:
+                raise PendingActionMismatch("The confirmation ID does not match.")
+            state.pending_action = None
+            state.expired_pending_language = None
+            state.expired_pending_action_type = None
+            state.updated_at = current
+            return self._clone_action(action)
+
+    def discard_pending_action(self, session_id: str) -> PendingAction | None:
+        with self._lock:
+            state = self._sessions.get(session_id)
+            if state is None or state.pending_action is None:
+                return None
+            action = self._clone_action(state.pending_action)
+            state.pending_action = None
+            state.expired_pending_language = None
+            state.expired_pending_action_type = None
+            state.updated_at = self._now()
+            return action
+
+    def get_history(self, session_id: str) -> list[HistoryItem]:
+        with self._lock:
+            state = self._sessions.get(session_id)
+            return deepcopy(state.history) if state else []
+
+    def append_history(self, session_id: str, role: str, content: str) -> None:
+        with self._lock:
+            self.ensure_session(session_id)
+            state = self._sessions[session_id]
+            state.history.append({"role": role, "content": content})
+            state.history = state.history[-self.history_limit :]
+            state.updated_at = self._now()
+
+    def clear(self) -> None:
+        with self._lock:
+            self._sessions.clear()
+
+
+_settings = get_settings()
+session_store = InMemorySessionStore(
+    confirmation_ttl_seconds=_settings.confirmation_ttl_seconds,
+    session_ttl_seconds=_settings.session_ttl_seconds,
+)

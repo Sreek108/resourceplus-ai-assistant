@@ -1,0 +1,2 @@
+"""ResourcePlus AI Assistant backend."""
+

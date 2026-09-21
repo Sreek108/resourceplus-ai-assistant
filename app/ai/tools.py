@@ -1,0 +1,541 @@
+import json
+import logging
+import re
+from calendar import monthrange
+from dataclasses import dataclass
+from datetime import date, timedelta
+from typing import Any
+
+from app.ai.actions import ActionResolutionRequired, prepare_write_action
+from app.ai.sessions import PendingAction, SessionStore, session_store
+from app.audit import record_action_state, record_safe_error, record_tool_usage
+from app.resourceplus import ResourcePlusError
+from app.resourceplus.approvals import get_pending_approvals
+from app.resourceplus.attendance import (
+    get_attendance_summary,
+    get_exception_reasons,
+    get_missing_punch_suggestions,
+)
+from app.resourceplus.employee import get_profile_data
+from app.resourceplus.home import get_home_data
+from app.resourceplus.leave import get_day_types
+from app.resourceplus.notifications import get_notifications
+from app.resourceplus.requests import get_my_request_status
+
+
+logger = logging.getLogger(__name__)
+
+
+def _empty_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": False,
+    }
+
+
+def _date_range_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "from_date": {
+                "type": "string",
+                "description": "Inclusive start date in YYYY-MM-DD format.",
+            },
+            "to_date": {
+                "type": "string",
+                "description": "Inclusive end date in YYYY-MM-DD format.",
+            },
+        },
+        "required": ["from_date", "to_date"],
+        "additionalProperties": False,
+    }
+
+
+TOOL_DEFINITIONS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "name": "get_attendance_summary",
+        "description": (
+            "Get the authenticated employee's attendance summary for an exact "
+            "inclusive date range."
+        ),
+        "parameters": _date_range_schema(),
+        "strict": True,
+    },
+    {
+        "type": "function",
+        "name": "get_home_data",
+        "description": (
+            "Get the authenticated employee's ResourcePlus home/dashboard data, "
+            "including vacation balance, service days, assets, documents, and loans."
+        ),
+        "parameters": _empty_schema(),
+        "strict": True,
+    },
+    {
+        "type": "function",
+        "name": "get_profile_data",
+        "description": "Get the authenticated employee's ResourcePlus profile.",
+        "parameters": _empty_schema(),
+        "strict": True,
+    },
+    {
+        "type": "function",
+        "name": "get_missing_punch_suggestions",
+        "description": (
+            "Get ResourcePlus-authoritative missing IN/OUT punch suggestions and "
+            "suggested times for an inclusive date range."
+        ),
+        "parameters": _date_range_schema(),
+        "strict": True,
+    },
+    {
+        "type": "function",
+        "name": "get_exception_reasons",
+        "description": "Get valid ResourcePlus reasons for exceptional entries.",
+        "parameters": _empty_schema(),
+        "strict": True,
+    },
+    {
+        "type": "function",
+        "name": "get_day_types",
+        "description": "Get valid ResourcePlus leave and business-travel day types.",
+        "parameters": _empty_schema(),
+        "strict": True,
+    },
+    {
+        "type": "function",
+        "name": "get_my_request_status",
+        "description": (
+            "Get and merge the authenticated employee's absence and exceptional-entry "
+            "request statuses for an inclusive date range."
+        ),
+        "parameters": _date_range_schema(),
+        "strict": True,
+    },
+    {
+        "type": "function",
+        "name": "get_pending_approvals",
+        "description": (
+            "Get pending supervisor approvals for the configured manager identity."
+        ),
+        "parameters": _empty_schema(),
+        "strict": True,
+    },
+    {
+        "type": "function",
+        "name": "get_notifications",
+        "description": (
+            "Get the authenticated employee's ResourcePlus notifications for unread, "
+            "latest, HR-alert, and approval-notification questions."
+        ),
+        "parameters": _empty_schema(),
+        "strict": True,
+    },
+    {
+        "type": "function",
+        "name": "prepare_exceptional_entry",
+        "description": (
+            "Prepare, but do not submit, a less-hours exceptional-entry correction. "
+            "Provide the intended date and the employee's natural reason. The backend "
+            "re-reads attendance, the ResourcePlus punch suggestion, and live reasons; "
+            "it alone selects the exact time, punch type, and reason ID."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "target_date": {
+                    "type": ["string", "null"],
+                    "description": (
+                        "Selected attendance date as YYYY-MM-DD, or null when the "
+                        "employee has not selected one."
+                    ),
+                },
+                "reason_name": {
+                    "type": "string",
+                    "description": (
+                        "The employee's natural-language reason. Do not invent or "
+                        "supply a ResourcePlus reason ID."
+                    ),
+                },
+                "remarks": {
+                    "type": "string",
+                    "description": "The employee's own requested remarks; do not invent facts.",
+                },
+            },
+            "required": ["target_date", "reason_name", "remarks"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+    {
+        "type": "function",
+        "name": "prepare_book_day_type",
+        "description": (
+            "Prepare, but do not submit, leave or business travel. Use an exact day "
+            "type name returned by get_day_types."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "date_from": {"type": "string", "description": "YYYY-MM-DD"},
+                "date_to": {"type": "string", "description": "YYYY-MM-DD"},
+                "day_type_name": {"type": "string"},
+            },
+            "required": ["date_from", "date_to", "day_type_name"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+    {
+        "type": "function",
+        "name": "prepare_cancel_day_type_request",
+        "description": (
+            "Find and prepare cancellation of one real pending absence request. Never "
+            "accept or invent a mapping ID."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "day_type_name": {"type": "string"},
+                "date_from": {"type": "string", "description": "YYYY-MM-DD"},
+                "date_to": {
+                    "anyOf": [{"type": "string"}, {"type": "null"}],
+                    "description": "YYYY-MM-DD, or null when only one date was given.",
+                },
+            },
+            "required": ["day_type_name", "date_from", "date_to"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+    {
+        "type": "function",
+        "name": "prepare_supervisor_request",
+        "description": (
+            "Find one real pending supervisor request and prepare approval or rejection. "
+            "Never accept or invent request IDs or request types."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "employee_name": {"type": "string"},
+                "detail": {
+                    "anyOf": [{"type": "string"}, {"type": "null"}],
+                },
+                "decision": {"type": "string", "enum": ["approve", "reject"]},
+            },
+            "required": ["employee_name", "detail", "decision"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+    {
+        "type": "function",
+        "name": "prepare_approve_all_requests",
+        "description": (
+            "Count current pending supervisor requests and prepare a confirmed bulk "
+            "approve or reject action."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "decision": {"type": "string", "enum": ["approve", "reject"]},
+                "request_type": {
+                    "type": "string",
+                    "enum": ["all", "Absence", "ExceptionEntry"],
+                },
+            },
+            "required": ["decision", "request_type"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+    {
+        "type": "function",
+        "name": "prepare_notification_read_status",
+        "description": (
+            "Prepare, but do not execute, marking one real ResourcePlus notification "
+            "or all notifications read or unread. Never accept or invent notifcnID."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "target": {
+                    "type": "string",
+                    "enum": ["latest", "one", "all"],
+                },
+                "notification_title": {
+                    "anyOf": [{"type": "string"}, {"type": "null"}],
+                    "description": "Exact title for target=one; otherwise null.",
+                },
+                "read_status": {
+                    "type": "integer",
+                    "enum": [0, 1],
+                    "description": "0 for unread; 1 for read.",
+                },
+            },
+            "required": ["target", "notification_title", "read_status"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+]
+
+READ_TOOL_NAMES = {
+    "get_attendance_summary",
+    "get_home_data",
+    "get_profile_data",
+    "get_missing_punch_suggestions",
+    "get_exception_reasons",
+    "get_day_types",
+    "get_my_request_status",
+    "get_pending_approvals",
+    "get_notifications",
+}
+WRITE_INTENT_TOOL_NAMES = {
+    "prepare_exceptional_entry",
+    "prepare_book_day_type",
+    "prepare_cancel_day_type_request",
+    "prepare_supervisor_request",
+    "prepare_approve_all_requests",
+    "prepare_notification_read_status",
+}
+ALLOWED_TOOL_NAMES = READ_TOOL_NAMES | WRITE_INTENT_TOOL_NAMES
+
+
+@dataclass(frozen=True)
+class DateRange:
+    label: str
+    from_date: date
+    to_date: date
+
+
+@dataclass(frozen=True)
+class ToolExecutionResult:
+    output: str
+    failed: bool = False
+    pending_action: PendingAction | None = None
+
+
+def resolve_relative_date_range(
+    message: str,
+    *,
+    today: date | None = None,
+) -> DateRange | None:
+    """Resolve supported relative periods without relying on the model."""
+
+    current = today or date.today()
+    normalized = message.casefold()
+    # English relative dates are resolved deterministically. Other languages are
+    # understood by the model and still receive the backend date in context; no
+    # language-specific command phrase map is maintained here.
+    patterns: list[tuple[str, tuple[str, ...]]] = [
+        ("last_week", (r"\blast week\b",)),
+        ("this_week", (r"\bthis week\b",)),
+        ("this_month", (r"\bthis month\b",)),
+        ("yesterday", (r"\byesterday\b",)),
+        ("today", (r"\btoday\b",)),
+    ]
+    selected: str | None = None
+    for label, variants in patterns:
+        if any(
+            re.search(variant, normalized) if variant.startswith(r"\b") else variant in normalized
+            for variant in variants
+        ):
+            selected = label
+            break
+
+    if selected == "today":
+        return DateRange(selected, current, current)
+    if selected == "yesterday":
+        day = current - timedelta(days=1)
+        return DateRange(selected, day, day)
+    if selected == "this_week":
+        start = current - timedelta(days=current.weekday())
+        return DateRange(selected, start, current)
+    if selected == "last_week":
+        this_week_start = current - timedelta(days=current.weekday())
+        start = this_week_start - timedelta(days=7)
+        return DateRange(selected, start, this_week_start - timedelta(days=1))
+    if selected == "this_month":
+        return DateRange(selected, current.replace(day=1), current)
+    return None
+
+
+def date_context(message: str, *, today: date | None = None) -> tuple[str, DateRange | None]:
+    current = today or date.today()
+    resolved = resolve_relative_date_range(message, today=current)
+    context = f"Backend date: {current.isoformat()}."
+    if resolved:
+        calendar_month_end = date(
+            resolved.from_date.year,
+            resolved.from_date.month,
+            monthrange(resolved.from_date.year, resolved.from_date.month)[1],
+        )
+        context += (
+            f" The backend resolved '{resolved.label}' to the inclusive range "
+            f"{resolved.from_date.isoformat()} through {resolved.to_date.isoformat()}. "
+            "Use these dates for attendance and other past-to-present queries."
+        )
+        if resolved.label == "this_month":
+            context += (
+                " For get_my_request_status only, use the complete calendar month "
+                f"through {calendar_month_end.isoformat()}."
+            )
+    return context, resolved
+
+
+def _tool_dates(
+    tool_name: str,
+    arguments: dict[str, Any],
+    resolved_range: DateRange | None,
+) -> tuple[object, object]:
+    if resolved_range:
+        end = resolved_range.to_date
+        if tool_name == "get_my_request_status" and resolved_range.label == "this_month":
+            end = date(
+                resolved_range.from_date.year,
+                resolved_range.from_date.month,
+                monthrange(
+                    resolved_range.from_date.year,
+                    resolved_range.from_date.month,
+                )[1],
+            )
+        return resolved_range.from_date.isoformat(), end.isoformat()
+    return arguments.get("from_date"), arguments.get("to_date")
+
+
+def _without_notification_query_strings(data: Any) -> Any:
+    if not isinstance(data, list):
+        return data
+    return [
+        {key: value for key, value in item.items() if key != "QueryString"}
+        if isinstance(item, dict)
+        else item
+        for item in data
+    ]
+
+
+async def execute_tool(
+    name: str,
+    arguments: dict[str, Any],
+    *,
+    lang: int,
+    session_id: str,
+    response_language: str,
+    resolved_range: DateRange | None = None,
+    store: SessionStore = session_store,
+) -> ToolExecutionResult:
+    if name not in ALLOWED_TOOL_NAMES:
+        return ToolExecutionResult(
+            json.dumps({"success": False, "error": "Unsupported tool."}),
+            failed=True,
+        )
+
+    record_tool_usage(name)
+    try:
+        if name == "get_attendance_summary":
+            start, end = _tool_dates(name, arguments, resolved_range)
+            data = await get_attendance_summary(start, end, lang=lang)
+        elif name == "get_home_data":
+            data = await get_home_data(lang=lang)
+        elif name == "get_profile_data":
+            data = await get_profile_data(lang=lang)
+        elif name == "get_missing_punch_suggestions":
+            start, end = _tool_dates(name, arguments, resolved_range)
+            data = await get_missing_punch_suggestions(start, end, lang=lang)
+        elif name == "get_exception_reasons":
+            data = await get_exception_reasons(lang=lang)
+        elif name == "get_day_types":
+            data = await get_day_types(lang=lang)
+        elif name == "get_my_request_status":
+            start, end = _tool_dates(name, arguments, resolved_range)
+            data = await get_my_request_status(start, end, lang=lang)
+        elif name == "get_pending_approvals":
+            data = await get_pending_approvals(lang=lang)
+        elif name == "get_notifications":
+            data = _without_notification_query_strings(
+                await get_notifications(lang=lang)
+            )
+        else:
+            intent_arguments = dict(arguments)
+            if resolved_range and name == "prepare_exceptional_entry":
+                intent_arguments["_range_from"] = resolved_range.from_date.isoformat()
+                intent_arguments["_range_to"] = resolved_range.to_date.isoformat()
+                if (
+                    resolved_range.from_date == resolved_range.to_date
+                    and not intent_arguments.get("target_date")
+                ):
+                    intent_arguments["target_date"] = resolved_range.from_date.isoformat()
+            if resolved_range and name in {
+                "prepare_book_day_type",
+                "prepare_cancel_day_type_request",
+            }:
+                intent_arguments["date_from"] = resolved_range.from_date.isoformat()
+                intent_arguments["date_to"] = resolved_range.to_date.isoformat()
+            intent = await prepare_write_action(
+                name,
+                intent_arguments,
+                lang=lang,
+                response_language=response_language,
+            )
+            pending = store.create_pending_action(
+                session_id,
+                action_type=intent.action_type,
+                validated_arguments=intent.validated_arguments,
+                summary=intent.summary,
+                language=intent.language,
+            )
+            record_action_state(
+                action_type=intent.action_type,
+                state="pending_confirmation",
+                confirmation_required=True,
+                confirmed=False,
+            )
+            return ToolExecutionResult(
+                json.dumps(
+                    {
+                        "success": True,
+                        "requires_confirmation": True,
+                        "confirmation_id": pending.confirmation_id,
+                        "summary": pending.summary,
+                    },
+                    ensure_ascii=False,
+                ),
+                pending_action=pending,
+            )
+    except ActionResolutionRequired as exc:
+        logger.info(
+            "EXCEPTIONAL_ENTRY_RESOLUTION category=%s",
+            exc.category,
+        )
+        return ToolExecutionResult(
+            json.dumps(
+                {
+                    "success": True,
+                    "prepared": False,
+                    "requires_clarification": exc.requires_clarification,
+                    "message": str(exc),
+                },
+                ensure_ascii=False,
+            )
+        )
+    except ResourcePlusError as exc:
+        record_safe_error("resourceplus_error")
+        return ToolExecutionResult(
+            json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False),
+            failed=True,
+        )
+    except (ValueError, TypeError, KeyError) as exc:
+        record_safe_error("validation_error")
+        return ToolExecutionResult(
+            json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False),
+            failed=True,
+        )
+
+    return ToolExecutionResult(
+        json.dumps({"success": True, "data": data}, ensure_ascii=False, default=str)
+    )

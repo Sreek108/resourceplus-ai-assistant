@@ -1,0 +1,323 @@
+export function resolveApiBaseUrl({
+  configuredBase = "",
+  developmentDefault = "",
+  isDev = false,
+} = {}) {
+  if (!isDev) return "";
+  return configuredBase.trim().replace(/\/$/, "") || developmentDefault;
+}
+
+const API_BASE_URL = resolveApiBaseUrl({
+  configuredBase: import.meta.env.VITE_API_BASE_URL,
+  developmentDefault: import.meta.env.DEV ? "http://127.0.0.1:8001" : "",
+  isDev: import.meta.env.DEV,
+});
+
+export function buildVoiceStreamUrl({
+  apiBaseUrl = API_BASE_URL,
+  pageLocation = globalThis.location,
+} = {}) {
+  const origin = pageLocation?.origin;
+  if (!apiBaseUrl && !origin) {
+    throw new Error("A browser origin is required for streaming voice.");
+  }
+  const socketUrl = new URL("/api/voice/stream", apiBaseUrl || origin);
+  socketUrl.protocol = socketUrl.protocol === "https:" ? "wss:" : "ws:";
+  return socketUrl.toString();
+}
+
+export class ClientRequestError extends Error {
+  constructor(message, code) {
+    super(message);
+    this.name = "ClientRequestError";
+    this.code = code;
+  }
+}
+
+async function parseResponse(response, requestType) {
+  let payload = null;
+  try {
+    payload = await response.json();
+  } catch {
+    // A non-JSON upstream failure is still reported using a safe status message.
+  }
+  if (!response.ok) {
+    const serverCode = payload?.code || payload?.detail?.code;
+    const failure = friendlyStatusMessage(response.status, requestType, serverCode);
+    throw new ClientRequestError(failure.message, failure.code);
+  }
+  return payload;
+}
+
+function friendlyStatusMessage(status, requestType, serverCode) {
+  if (serverCode === "no_speech" || (status === 400 && requestType === "voice")) {
+    return {
+      code: "no_speech",
+      message: "I couldn’t hear enough speech. Hold the mic and try again.",
+    };
+  }
+  if (status === 413) {
+    return {
+      code: "audio_too_large",
+      message: "That recording is too long. Please try a shorter message.",
+    };
+  }
+  if (status === 409 || status === 410) {
+    return {
+      code: "confirmation_expired",
+      message: "That confirmation has expired. Please ask me to prepare it again.",
+    };
+  }
+  if (status === 422) {
+    return {
+      code: "invalid_request",
+      message: "I couldn’t process that message. Please try again.",
+    };
+  }
+  if (serverCode === "speech_recognition_failed") {
+    return {
+      code: serverCode,
+      message: "I couldn’t recognize that voice message. Please try again or type instead.",
+    };
+  }
+  if (serverCode === "speech_synthesis_failed") {
+    return {
+      code: serverCode,
+      message: "I understood you, but couldn’t create a spoken reply. Please try again or type instead.",
+    };
+  }
+  if (serverCode === "voice_unavailable") {
+    return {
+      code: serverCode,
+      message: "Voice is temporarily unavailable. You can keep chatting by typing.",
+    };
+  }
+  if (serverCode === "resourceplus_unavailable" || status === 504) {
+    return {
+      code: "resourceplus_unavailable",
+      message: "ResourcePlus is temporarily unavailable. Please try again shortly.",
+    };
+  }
+  if (serverCode === "assistant_unavailable") {
+    return {
+      code: "assistant_unavailable",
+      message: "The assistant is temporarily unavailable. Please try again shortly.",
+    };
+  }
+  if (requestType === "voice" && status === 502) {
+    return {
+      code: "speech_processing_failed",
+      message: "I couldn’t process that voice message. You can try again or type instead.",
+    };
+  }
+  if (requestType === "voice" && status === 503) {
+    return {
+      code: "voice_backend_unavailable",
+      message: "Voice is temporarily unavailable. You can keep chatting by typing.",
+    };
+  }
+  if (status === 502) {
+    return {
+      code: "request_failed",
+      message: "The assistant couldn’t complete that request. Please try again.",
+    };
+  }
+  if (status === 503) {
+    return {
+      code: "assistant_unavailable",
+      message: "The assistant is temporarily unavailable. Please try again shortly.",
+    };
+  }
+  return { code: "request_failed", message: "Something went wrong. Please try again." };
+}
+
+export async function sendChat({ message, sessionId, confirmationId }) {
+  try {
+    const response = await fetch(`${API_BASE_URL}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        message,
+        ...(sessionId ? { session_id: sessionId } : {}),
+        ...(confirmationId ? { confirmation_id: confirmationId } : {}),
+      }),
+    });
+    return await parseResponse(response, "text");
+  } catch (error) {
+    if (error instanceof TypeError) {
+      throw new ClientRequestError(
+        "I couldn’t connect to the assistant. Check the connection and try again.",
+        "network_failure",
+      );
+    }
+    throw error;
+  }
+}
+
+export async function sendVoice({ audio, sessionId, confirmationId }) {
+  const form = new FormData();
+  form.append("audio", audio, "resourceplus-voice.wav");
+  if (sessionId) form.append("session_id", sessionId);
+  if (confirmationId) form.append("confirmation_id", confirmationId);
+  try {
+    const response = await fetch(`${API_BASE_URL}/api/voice/chat`, {
+      method: "POST",
+      body: form,
+    });
+    return await parseResponse(response, "voice");
+  } catch (error) {
+    if (error instanceof TypeError) {
+      throw new ClientRequestError(
+        "I couldn’t connect to voice right now. You can keep chatting by typing.",
+        "network_failure",
+      );
+    }
+    throw error;
+  }
+}
+
+export function openVoiceStream({ sessionId, confirmationId, debug = false }) {
+  if (!globalThis.WebSocket) {
+    return Promise.reject(
+      new ClientRequestError("Streaming voice is unavailable.", "stream_unavailable"),
+    );
+  }
+  return new Promise((resolve, reject) => {
+    const socket = new WebSocket(buildVoiceStreamUrl());
+    socket.binaryType = "arraybuffer";
+    let ready = false;
+    let settled = false;
+    let finalSettled = false;
+    let cancelled = false;
+    let ended = false;
+    let resolveFinal;
+    let rejectFinal;
+    const finalResponse = new Promise((resolveResult, rejectResult) => {
+      resolveFinal = resolveResult;
+      rejectFinal = rejectResult;
+    });
+
+    const connectTimer = window.setTimeout(() => {
+      fail("Streaming voice is unavailable.", "stream_connect_timeout");
+      socket.close();
+    }, 10_000);
+
+    function rejectFinalOnce(error) {
+      if (finalSettled) return;
+      finalSettled = true;
+      rejectFinal(error);
+    }
+
+    function fail(message, code = "stream_unavailable") {
+      const error = new ClientRequestError(message, code);
+      if (!ready) {
+        if (!settled) {
+          settled = true;
+          window.clearTimeout(connectTimer);
+          reject(error);
+        }
+        return;
+      }
+      rejectFinalOnce(error);
+    }
+
+    socket.onopen = () => {
+      socket.send(JSON.stringify({
+        type: "start",
+        sample_rate: 16_000,
+        ...(sessionId ? { session_id: sessionId } : {}),
+        ...(confirmationId ? { confirmation_id: confirmationId } : {}),
+        ...(debug ? { debug: true } : {}),
+      }));
+    };
+    socket.onmessage = (event) => {
+      if (typeof event.data !== "string") return;
+      let payload;
+      try {
+        payload = JSON.parse(event.data);
+      } catch {
+        fail("I couldnâ€™t process that voice message.", "stream_invalid_response");
+        return;
+      }
+      if (payload.type === "ready" && !ready) {
+        ready = true;
+        settled = true;
+        window.clearTimeout(connectTimer);
+        resolve({
+          sendChunk(chunk) {
+            if (socket.readyState !== WebSocket.OPEN) {
+              throw new ClientRequestError(
+                "The streaming voice connection was interrupted.",
+                "stream_disconnected",
+              );
+            }
+            socket.send(chunk);
+          },
+          finish() {
+            if (!ended) {
+              ended = true;
+              if (socket.readyState === WebSocket.OPEN) {
+                socket.send(JSON.stringify({ type: "end" }));
+              } else {
+                fail(
+                  "The streaming voice connection was interrupted.",
+                  "stream_disconnected",
+                );
+              }
+            }
+            return finalResponse;
+          },
+          cancel() {
+            if (cancelled) return;
+            cancelled = true;
+            if (socket.readyState === WebSocket.OPEN) {
+              socket.send(JSON.stringify({ type: "cancel" }));
+            }
+            finalSettled = true;
+            socket.close();
+          },
+        });
+        return;
+      }
+      if (payload.type === "final") {
+        if (!finalSettled) {
+          finalSettled = true;
+          resolveFinal(payload);
+        }
+        socket.close();
+        return;
+      }
+      if (payload.type === "error") {
+        fail(
+          payload.message || "I couldnâ€™t process that voice message.",
+          payload.code || "stream_failed",
+        );
+        socket.close();
+      }
+    };
+    socket.onerror = () => {
+      fail("Streaming voice is unavailable.", "stream_unavailable");
+      socket.close();
+    };
+    socket.onclose = () => {
+      window.clearTimeout(connectTimer);
+      if (!settled) {
+        fail("Streaming voice is unavailable.", "stream_unavailable");
+      } else if (!finalSettled && !cancelled) {
+        fail(
+          "The streaming voice connection was interrupted.",
+          "stream_disconnected",
+        );
+      }
+    };
+  });
+}
+
+export function audioBase64ToUrl(base64, mimeType = "audio/wav") {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return URL.createObjectURL(new Blob([bytes], { type: mimeType }));
+}
