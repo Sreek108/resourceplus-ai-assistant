@@ -69,6 +69,72 @@ async def test_existing_read_tool_loop_still_returns_final_answer(monkeypatch) -
     )
 
 
+@pytest.mark.asyncio
+async def test_terminal_clarification_stops_tool_loop_after_one_model_call(
+    monkeypatch,
+) -> None:
+    tool_call = SimpleNamespace(
+        output=[
+            SimpleNamespace(
+                type="function_call",
+                name="prepare_exceptional_entry",
+                arguments=(
+                    '{"target_date":"2026-09-01","punch_direction":"IN",'
+                    '"reason_name":null,"remarks":null}'
+                ),
+                call_id="reason-required",
+            )
+        ],
+        output_text="",
+    )
+
+    class FakeResponses:
+        def __init__(self):
+            self.calls = []
+
+        async def create(self, **kwargs):
+            self.calls.append(kwargs)
+            if len(self.calls) > 1:
+                raise AssertionError("A terminal clarification must not re-enter OpenAI")
+            return tool_call
+
+    responses = FakeResponses()
+    monkeypatch.setattr(
+        agent,
+        "get_settings",
+        lambda: SimpleNamespace(openai_api_key="test", openai_model="test-model"),
+    )
+    monkeypatch.setattr(
+        agent,
+        "AsyncOpenAI",
+        lambda api_key: SimpleNamespace(responses=responses),
+    )
+
+    async def execute(*args, **kwargs):
+        return ToolExecutionResult(
+            output='{"success":true,"needs_reason":true}',
+            terminal_message="What was the reason?",
+            needs_reason=True,
+            reason_options=["Embassy Purposes", "Family Circumstances"],
+        )
+
+    monkeypatch.setattr(agent, "execute_tool", execute)
+    result = await agent.run_agent(
+        "Correct my September 1 IN punch",
+        lang=1,
+        session_id="terminal-clarification",
+        history=[],
+    )
+
+    assert result.message == "What was the reason?"
+    assert result.speech_message == "What was the reason?"
+    assert result.requires_confirmation is False
+    assert result.needs_reason is True
+    assert result.reason_options == ["Embassy Purposes", "Family Circumstances"]
+    assert result.tools_used == ["prepare_exceptional_entry"]
+    assert len(responses.calls) == 1
+
+
 def test_system_prompt_prefers_conversation_without_weakening_authority() -> None:
     assert "Answer the user's direct question first" in SYSTEM_PROMPT
     assert "one to three short sentences" in SYSTEM_PROMPT
@@ -88,6 +154,15 @@ def test_system_prompt_prefers_conversation_without_weakening_authority() -> Non
     assert "without exaggerated slang" in SYSTEM_PROMPT
     assert "English HR terms" in SYSTEM_PROMPT
     assert "must never change" in SYSTEM_PROMPT
+    assert "Never ask the employee for an exceptional-entry reason before calling" in (
+        SYSTEM_PROMPT
+    )
+    assert "AttendanceSummary LessHrs alone never proves a missing IN or OUT" in (
+        SYSTEM_PROMPT
+    )
+    assert "NetHrs is the time actually worked" in SYSTEM_PROMPT
+    assert "LessHrs is the" in SYSTEM_PROMPT
+    assert "worked 40 minutes and was 7 hours 20 minutes short" in SYSTEM_PROMPT
     assert "only a prepare_* tool" in SYSTEM_PROMPT
 
 

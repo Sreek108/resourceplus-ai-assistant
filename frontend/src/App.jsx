@@ -55,6 +55,7 @@ export default function App() {
   const voiceSubmissionRef = useRef(false);
   const playbackManagerRef = useRef(null);
   const playbackTokenRef = useRef(0);
+  const reasonSelectionRef = useRef(false);
   const chatScrollRef = useRef(null);
   const audioUrlsRef = useRef(new Set());
   const debug = useMemo(
@@ -158,9 +159,26 @@ export default function App() {
     return {
       id: uniqueId(),
       role: "assistant",
-      text: response.message || "I couldn’t complete that request. Please try again.",
-      language: response.language || messageLanguage(response.message),
+      text:
+        response.display_message
+        || response.message
+        || "I couldn’t complete that request. Please try again.",
+      language:
+        response.language
+        || messageLanguage(response.display_message || response.message),
       requiresConfirmation: Boolean(response.requires_confirmation),
+      needsReason: Boolean(response.needs_reason),
+      reasonOptionsActive: Boolean(response.needs_reason),
+      reasonOptions: Array.isArray(response.reason_options)
+        ? response.reason_options
+            .filter(
+              (option) =>
+                option
+                && typeof option.label === "string"
+                && typeof option.value === "string",
+            )
+            .map(({ label, value }) => ({ label, value }))
+        : [],
       ...extras,
       debug: {
         detected_language: extras.detectedLanguage || response.language,
@@ -176,7 +194,11 @@ export default function App() {
 
   function appendTurn(userMessage, assistant) {
     setMessages((current) => [
-      ...current.map((message) => ({ ...message, requiresConfirmation: false })),
+      ...current.map((message) => ({
+        ...message,
+        requiresConfirmation: false,
+        reasonOptionsActive: false,
+      })),
       userMessage,
       assistant,
     ]);
@@ -184,7 +206,7 @@ export default function App() {
 
   async function submitText(textOverride, confirmationOverride) {
     const text = (textOverride ?? input).trim();
-    if (!text || busy) return;
+    if (!text || busy) return false;
     setInput("");
     setError("");
     setNotice("");
@@ -195,7 +217,13 @@ export default function App() {
       text,
       language: messageLanguage(text),
     };
-    setMessages((current) => [...current, userMessage]);
+    setMessages((current) => [
+      ...current.map((message) => ({
+        ...message,
+        reasonOptionsActive: false,
+      })),
+      userMessage,
+    ]);
     try {
       const response = await sendChat({
         message: text,
@@ -207,11 +235,46 @@ export default function App() {
         ...current.map((message) => ({ ...message, requiresConfirmation: false })),
         assistantMessage(response),
       ]);
+      return true;
     } catch (requestError) {
       setError(requestError.message || "Could not send your message. Please try again.");
+      return false;
     } finally {
       setStatus("idle");
     }
+  }
+
+  async function submitReason(messageId, value) {
+    if (busy || reasonSelectionRef.current) return;
+    reasonSelectionRef.current = true;
+    setMessages((current) =>
+      current.map((message) =>
+        message.id === messageId
+          ? {
+              ...message,
+              selectedReason: value,
+              reasonSelectionPending: true,
+              reasonOptionsActive: false,
+            }
+          : message,
+      ),
+    );
+    const sent = await submitText(value);
+    if (!sent) {
+      setMessages((current) =>
+        current.map((message) =>
+          message.id === messageId
+            ? {
+                ...message,
+                selectedReason: undefined,
+                reasonSelectionPending: false,
+                reasonOptionsActive: true,
+              }
+            : message,
+        ),
+      );
+    }
+    reasonSelectionRef.current = false;
   }
 
   async function beginVoiceHold() {
@@ -420,6 +483,7 @@ export default function App() {
     playbackManagerRef.current.stop();
     for (const url of audioUrlsRef.current) URL.revokeObjectURL(url);
     audioUrlsRef.current.clear();
+    reasonSelectionRef.current = false;
     setMessages([]);
     setSessionId("");
     setConfirmationId("");
@@ -459,6 +523,7 @@ export default function App() {
                     onReplay={replayAudio}
                     onConfirm={() => submitText("Yes", confirmationId)}
                     onCancel={() => submitText("No", confirmationId)}
+                    onReasonSelect={(value) => submitReason(message.id, value)}
                     busy={busy}
                     debug={debug}
                   />

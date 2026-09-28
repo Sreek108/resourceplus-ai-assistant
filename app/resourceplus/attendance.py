@@ -1,3 +1,4 @@
+import re
 from datetime import date, datetime
 from typing import Any
 
@@ -93,23 +94,24 @@ async def get_exception_reasons(
     )
 
 
-def _parse_iso_datetime(value: datetime | str) -> datetime:
-    if isinstance(value, datetime):
-        parsed = value
-    else:
-        try:
-            parsed = datetime.fromisoformat(value)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                "entry_time must use YYYY-MM-DDTHH:MM:SS format."
-            ) from exc
-    if parsed.tzinfo is not None:
-        raise ValueError("entry_time must be a local datetime without a timezone.")
-    return parsed
+def _format_exceptional_entry_request_time(value: str) -> str:
+    """Validate an authoritative suggestion and format it for the write API."""
+
+    if not isinstance(value, str) or not value:
+        raise ValueError("entry_time is required.")
+    if not re.fullmatch(r"\d{2}/\d{2}/\d{4} \d{2}:\d{2}", value):
+        raise ValueError("entry_time must use DD/MM/YYYY HH:MM format.")
+    try:
+        parsed = datetime.strptime(value, "%d/%m/%Y %H:%M")
+    except ValueError as exc:
+        raise ValueError("entry_time must use DD/MM/YYYY HH:MM format.") from exc
+    if parsed.strftime("%d/%m/%Y %H:%M") != value:
+        raise ValueError("entry_time must use DD/MM/YYYY HH:MM format.")
+    return parsed.strftime("%Y/%m/%d %H:%M")
 
 
 async def create_exceptional_entry(
-    entry_time: datetime | str,
+    entry_time: str,
     entry_type: int,
     reason_id: str,
     remarks: str,
@@ -117,7 +119,7 @@ async def create_exceptional_entry(
     *,
     client: ResourcePlusClient | None = None,
 ) -> Any:
-    parsed_time = _parse_iso_datetime(entry_time)
+    submit_entry_time = _format_exceptional_entry_request_time(entry_time)
     if entry_type not in {1, 2}:
         raise ValueError("entry_type must be 1 (IN) or 2 (OUT).")
     if not reason_id.strip():
@@ -133,7 +135,7 @@ async def create_exceptional_entry(
         params={"instanceName": settings.rp_instance},
         json_body={
             "usrEmail": identity,
-            "entryTime": parsed_time.isoformat(timespec="seconds"),
+            "entryTime": submit_entry_time,
             "entryType": entry_type,
             "reasonID": reason_id,
             "remarks": remarks.strip(),

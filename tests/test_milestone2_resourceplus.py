@@ -47,8 +47,13 @@ async def test_missing_punch_reads_and_exceptional_entry_post_contract() -> None
         requests.append(request)
         if request.url.path.endswith("/MissingPunchSuggestions"):
             assert request.method == "GET"
-            assert request.url.params["usrEmail"] == "employee@example.com"
-            assert request.url.params["fromDate"] == "2026-09-16"
+            assert dict(request.url.params) == {
+                "usrEmail": "employee@example.com",
+                "fromDate": "2026-09-16",
+                "toDate": "2026-09-16",
+                "instanceName": "Universal",
+                "lang": "1",
+            }
             return httpx.Response(
                 200,
                 json=[
@@ -61,7 +66,10 @@ async def test_missing_punch_reads_and_exceptional_entry_post_contract() -> None
             )
         if request.url.path.endswith("/ExceptionalEntries/Reasons"):
             assert request.method == "GET"
-            assert "usrEmail" not in request.url.params
+            assert dict(request.url.params) == {
+                "instanceName": "Universal",
+                "lang": "1",
+            }
             return httpx.Response(
                 200,
                 json=[{"reasonID": "reason-real", "reasonName": "Traffic"}],
@@ -72,7 +80,7 @@ async def test_missing_punch_reads_and_exceptional_entry_post_contract() -> None
         body = __import__("json").loads(request.content)
         assert body == {
             "usrEmail": "employee@example.com",
-            "entryTime": "2026-09-16T09:00:00",
+            "entryTime": "2026/09/16 09:00",
             "entryType": 1,
             "reasonID": "reason-real",
             "remarks": "Delayed due to traffic",
@@ -88,7 +96,7 @@ async def test_missing_punch_reads_and_exceptional_entry_post_contract() -> None
     )
     reasons = await get_exception_reasons(client=client)
     result = await create_exceptional_entry(
-        "2026-09-16T09:00:00",
+        "16/09/2026 09:00",
         1,
         reasons[0]["reasonID"],
         "Delayed due to traffic",
@@ -98,6 +106,80 @@ async def test_missing_punch_reads_and_exceptional_entry_post_contract() -> None
     assert suggestions[0]["entryType"] == "IN"
     assert result["success"] is True
     assert [request.method for request in requests] == ["GET", "GET", "POST"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid_entry_time",
+    [
+        "2026-09-16T09:00:00",
+        "22-09-2026 08:00",
+        "31/02/2026 08:00",
+    ],
+)
+async def test_exceptional_entry_rejects_invalid_time_before_post(
+    invalid_entry_time: str,
+) -> None:
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json={"success": True})
+
+    with pytest.raises(ValueError, match="DD/MM/YYYY HH:MM"):
+        await create_exceptional_entry(
+            invalid_entry_time,
+            1,
+            "reason-real",
+            "Traffic delay",
+            usr_email="employee@example.com",
+            client=mock_client(handler),
+        )
+
+    assert calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("suggested_entry_time", "submit_entry_time", "entry_type"),
+    [
+        ("22/09/2026 08:00", "2026/09/22 08:00", 1),
+        ("01/09/2026 17:00", "2026/09/01 17:00", 2),
+    ],
+)
+async def test_exceptional_entry_serializes_live_server_post_body(
+    suggested_entry_time: str,
+    submit_entry_time: str,
+    entry_type: int,
+) -> None:
+    captured: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json={"success": True})
+
+    await create_exceptional_entry(
+        suggested_entry_time,
+        entry_type,
+        "live-resourceplus-reason-guid",
+        "Update Iqama In Bank",
+        usr_email="employee@example.com",
+        client=mock_client(handler),
+    )
+
+    assert len(captured) == 1
+    request = captured[0]
+    assert request.method == "POST"
+    assert request.url.path == "/Mobile/api/AI/ExceptionalEntries/Request"
+    assert dict(request.url.params) == {"instanceName": "Universal"}
+    assert json.loads(request.content) == {
+        "usrEmail": "employee@example.com",
+        "entryTime": submit_entry_time,
+        "entryType": entry_type,
+        "reasonID": "live-resourceplus-reason-guid",
+        "remarks": "Update Iqama In Bank",
+    }
 
 
 @pytest.mark.asyncio

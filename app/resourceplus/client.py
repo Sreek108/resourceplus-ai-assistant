@@ -1,5 +1,7 @@
 import logging
+import re
 import time
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -17,6 +19,108 @@ from app.telemetry import (
 
 
 logger = logging.getLogger(__name__)
+
+_DIAGNOSTIC_ENVIRONMENTS = frozenset({"local", "dev", "development", "test", "uat"})
+_CORRELATION_HEADERS = (
+    "x-correlation-id",
+    "x-request-id",
+    "request-id",
+    "trace-id",
+)
+_SAFE_DIAGNOSTIC_ID = re.compile(r"^[A-Za-z0-9_./:-]{1,128}$")
+_SENSITIVE_TEXT = re.compile(
+    r"(?:[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}|https?://|"
+    r"authorization|bearer|password|api[_ -]?key|secret|token)",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class ResourcePlusUpstreamDiagnostic:
+    """Allowlisted metadata extracted from an upstream error response."""
+
+    code: str | None = None
+    message: str | None = None
+    correlation_id: str | None = None
+    validation_fields: tuple[str, ...] = ()
+
+
+def _safe_diagnostic_id(value: object) -> str | None:
+    candidate = str(value).strip() if isinstance(value, (str, int)) else ""
+    return candidate if _SAFE_DIAGNOSTIC_ID.fullmatch(candidate) else None
+
+
+def _safe_diagnostic_message(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    candidate = " ".join(value.split())
+    if not candidate or len(candidate) > 240 or _SENSITIVE_TEXT.search(candidate):
+        return None
+    if any(ord(character) < 32 for character in candidate):
+        return None
+    return candidate
+
+
+def _first_mapping_value(payload: dict[str, Any], *names: str) -> object:
+    normalized = {str(key).casefold(): value for key, value in payload.items()}
+    for name in names:
+        if name.casefold() in normalized:
+            return normalized[name.casefold()]
+    return None
+
+
+def _extract_upstream_diagnostic(
+    response: httpx.Response,
+) -> ResourcePlusUpstreamDiagnostic:
+    """Extract only short allowlisted fields; never retain or log the raw body."""
+
+    payload: dict[str, Any] = {}
+    try:
+        parsed = response.json()
+        if isinstance(parsed, dict):
+            payload = parsed
+    except ValueError:
+        pass
+
+    nested_error = _first_mapping_value(payload, "error")
+    nested = nested_error if isinstance(nested_error, dict) else {}
+    code = _safe_diagnostic_id(
+        _first_mapping_value(payload, "errorCode", "code")
+        or _first_mapping_value(nested, "errorCode", "code")
+    )
+    message = _safe_diagnostic_message(
+        _first_mapping_value(payload, "message", "title", "detail")
+        or _first_mapping_value(nested, "message", "title", "detail")
+        or (nested_error if isinstance(nested_error, str) else None)
+    )
+
+    validation = _first_mapping_value(payload, "errors", "validationErrors")
+    if not isinstance(validation, dict):
+        validation = _first_mapping_value(nested, "errors", "validationErrors")
+    validation_fields = tuple(
+        field
+        for field in (
+            _safe_diagnostic_id(key)
+            for key in (validation.keys() if isinstance(validation, dict) else ())
+        )
+        if field is not None
+    )[:12]
+
+    correlation_id = next(
+        (
+            safe_value
+            for header in _CORRELATION_HEADERS
+            if (safe_value := _safe_diagnostic_id(response.headers.get(header)))
+            is not None
+        ),
+        None,
+    )
+    return ResourcePlusUpstreamDiagnostic(
+        code=code,
+        message=message,
+        correlation_id=correlation_id,
+        validation_fields=validation_fields,
+    )
 
 
 class ResourcePlusError(Exception):
@@ -38,8 +142,16 @@ class ResourcePlusConfigurationError(ResourcePlusError):
 class ResourcePlusHTTPError(ResourcePlusError):
     """ResourcePlus returned a non-success HTTP response."""
 
-    def __init__(self, status_code: int) -> None:
+    def __init__(
+        self,
+        status_code: int,
+        *,
+        endpoint: str | None = None,
+        diagnostic: ResourcePlusUpstreamDiagnostic | None = None,
+    ) -> None:
         self.status_code = status_code
+        self.endpoint = endpoint
+        self.diagnostic = diagnostic or ResourcePlusUpstreamDiagnostic()
         super().__init__(f"ResourcePlus returned HTTP {status_code}.")
 
 
@@ -165,6 +277,10 @@ class ResourcePlusClient:
             )
 
         if response.is_error:
+            diagnostic = _extract_upstream_diagnostic(response)
+            expose_diagnostic = (
+                get_settings().app_environment.casefold() in _DIAGNOSTIC_ENVIRONMENTS
+            )
             emit_structured_event(
                 level="WARNING",
                 component="resourceplus_api",
@@ -175,13 +291,29 @@ class ResourcePlusClient:
                 error_owner="resourceplus_api",
                 error_stage="resourceplus",
                 retryable=response.status_code >= 500,
+                upstream_error_code=(
+                    diagnostic.code if expose_diagnostic else None
+                ),
+                upstream_error_message=(
+                    diagnostic.message if expose_diagnostic else None
+                ),
+                upstream_correlation_id=(
+                    diagnostic.correlation_id if expose_diagnostic else None
+                ),
+                validation_fields=(
+                    diagnostic.validation_fields if expose_diagnostic else ()
+                ),
             )
             logger.warning(
                 "ResourcePlus endpoint %s returned HTTP %s",
                 safe_endpoint,
                 response.status_code,
             )
-            raise ResourcePlusHTTPError(response.status_code)
+            raise ResourcePlusHTTPError(
+                response.status_code,
+                endpoint=safe_endpoint,
+                diagnostic=diagnostic,
+            )
 
         try:
             return response.json()

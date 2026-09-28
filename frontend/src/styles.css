@@ -650,6 +650,68 @@ summary:focus-visible {
   margin-top: 9px;
 }
 
+.reason-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 12px;
+  background: #f5faf9;
+  border: 1px solid #d7e9e7;
+  border-radius: 13px;
+}
+
+.reason-option {
+  min-height: 38px;
+  padding: 8px 12px;
+  color: #195e5b;
+  font-weight: 700;
+  line-height: 1.25;
+  background: #fff;
+  border: 1px solid #bcded9;
+  border-radius: 999px;
+}
+
+.reason-option:hover:not(:disabled) {
+  color: #fff;
+  background: #0a7d77;
+  border-color: #0a7d77;
+}
+
+.reason-option:focus-visible {
+  outline: 3px solid rgba(10, 125, 119, 0.28);
+  outline-offset: 2px;
+}
+
+.reason-option:disabled {
+  cursor: wait;
+  opacity: 0.58;
+}
+
+.reason-selected {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 10px;
+  padding: 9px 12px;
+  color: #18635f;
+  font-size: 0.8rem;
+  font-weight: 700;
+  background: #e9f6f3;
+  border: 1px solid #c9e6e1;
+  border-radius: 10px;
+}
+
+.reason-selected > span:first-child {
+  display: grid;
+  width: 20px;
+  height: 20px;
+  place-items: center;
+  color: #fff;
+  background: #0a7d77;
+  border-radius: 50%;
+}
+
 .confirmation-card {
   margin-top: 10px;
   padding: 16px;

@@ -1,14 +1,49 @@
 import json
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
-from app.ai import actions
+from app.ai import actions, tools as ai_tools
 from app.ai.actions import ActionIntent, execute_pending_action, prepare_write_action
 from app.ai.sessions import InMemorySessionStore
 from app.ai.tools import ALLOWED_TOOL_NAMES, TOOL_DEFINITIONS, DateRange, execute_tool
 from app.models.schemas import ChatRequest
 from app.services import chat as chat_service
+
+
+@pytest.mark.asyncio
+async def test_attendance_tool_explains_net_and_less_hours_for_speech(monkeypatch) -> None:
+    async def attendance(*args, **kwargs):
+        return {
+            "Days": [
+                {
+                    "AttDate": "22/09/2026",
+                    "NetHrs": "00:40",
+                    "LessHrs": "07:20",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(ai_tools, "get_attendance_summary", attendance)
+    result = await execute_tool(
+        "get_attendance_summary",
+        {"from_date": "2026-09-22", "to_date": "2026-09-22"},
+        lang=1,
+        session_id="attendance-semantics",
+        response_language="en",
+    )
+
+    payload = json.loads(result.output)
+    assert payload["data"]["Days"][0]["NetHrs"] == "00:40"
+    assert payload["data"]["Days"][0]["LessHrs"] == "07:20"
+    assert payload["attendance_semantics"] == {
+        "NetHrs": "time actually worked",
+        "LessHrs": "shortfall from required working hours",
+        "speech_rule": (
+            "State actual worked time and the shortfall as separate quantities; "
+            "never describe NetHrs as the amount worked less than expected."
+        ),
+    }
 
 
 @pytest.mark.asyncio
@@ -18,18 +53,6 @@ async def test_missing_punch_is_validated_and_not_posted_before_confirmation(
     write_calls: list[dict] = []
     read_calls: list[tuple[str, object, object]] = []
 
-    async def attendance(start, end, **kwargs):
-        read_calls.append(("attendance", start, end))
-        return {
-            "Days": [
-                {
-                    "Date": "16/09/2026",
-                    "LessHrs": "01:20",
-                    "DayType": "Present",
-                }
-            ]
-        }
-
     async def suggestions(start, end, **kwargs):
         read_calls.append(("suggestions", start, end))
         return [
@@ -37,6 +60,8 @@ async def test_missing_punch_is_validated_and_not_posted_before_confirmation(
                 "attDate": "16/09/2026",
                 "suggestedEntryTime": "16/09/2026 17:00",
                 "entryType": "OUT",
+                "shift": "General Shift (09:00 : 18:00)",
+                "isNightShift": 0,
             }
         ]
 
@@ -51,7 +76,6 @@ async def test_missing_punch_is_validated_and_not_posted_before_confirmation(
         write_calls.append(kwargs)
         return {"success": True, "message": "Exceptional entry submitted"}
 
-    monkeypatch.setattr(actions, "get_attendance_summary", attendance)
     monkeypatch.setattr(actions, "get_missing_punch_suggestions", suggestions)
     monkeypatch.setattr(actions, "get_exception_reasons", reasons)
     monkeypatch.setattr(actions, "create_exceptional_entry", submit)
@@ -62,22 +86,25 @@ async def test_missing_punch_is_validated_and_not_posted_before_confirmation(
             "target_date": "2026-09-16",
             "reason_name": "family circumstance",
             "remarks": "Family circumstance",
+            "_user_message": "Family circumstance",
         },
         lang=1,
         response_language="en",
     )
     assert write_calls == []
     assert read_calls == [
-        ("attendance", "2026-09-16", "2026-09-16"),
         ("suggestions", "2026-09-16", "2026-09-16"),
         ("reasons", None, None),
     ]
     assert intent.validated_arguments == {
-        "entry_time": "2026-09-16T17:00:00",
+        "entry_time": "16/09/2026 17:00",
         "entry_type": 2,
         "reason_id": "reason-family-live",
         "reason_name": "Family Circumstances",
         "remarks": "Family circumstance",
+        "attendance_date": "2026-09-16",
+        "shift": "General Shift (09:00 : 18:00)",
+        "is_night_shift": 0,
     }
     assert "OUT punch" in intent.summary
     assert "5:00 PM" in intent.summary
@@ -90,7 +117,7 @@ async def test_missing_punch_is_validated_and_not_posted_before_confirmation(
     assert result["success"] is True
     assert write_calls == [
         {
-            "entry_time": "2026-09-16T17:00:00",
+            "entry_time": "16/09/2026 17:00",
             "entry_type": 2,
             "reason_id": "reason-family-live",
             "remarks": "Family circumstance",
@@ -102,12 +129,10 @@ async def test_missing_punch_is_validated_and_not_posted_before_confirmation(
 async def test_exceptional_entry_ignores_model_supplied_time_type_and_ids(
     monkeypatch,
 ) -> None:
-    async def attendance(*args, **kwargs):
-        return {"Days": [{"Date": "16/09/2026", "LessHrs": "00:45"}]}
-
     async def suggestions(*args, **kwargs):
         return [
             {
+                "attDate": "16/09/2026",
                 "suggestedEntryTime": "16/09/2026 17:30",
                 "entryType": "OUT",
             }
@@ -116,7 +141,6 @@ async def test_exceptional_entry_ignores_model_supplied_time_type_and_ids(
     async def reasons(*args, **kwargs):
         return [{"reasonID": "reason-live", "reasonName": "Traffic"}]
 
-    monkeypatch.setattr(actions, "get_attendance_summary", attendance)
     monkeypatch.setattr(actions, "get_missing_punch_suggestions", suggestions)
     monkeypatch.setattr(actions, "get_exception_reasons", reasons)
     intent = await prepare_write_action(
@@ -125,6 +149,7 @@ async def test_exceptional_entry_ignores_model_supplied_time_type_and_ids(
             "target_date": "2026-09-16",
             "reason_name": "Traffic",
             "remarks": "Traffic",
+            "_user_message": "Traffic",
             "entry_time": "2099-01-01T08:30:00",
             "entry_type": 1,
             "reason_id": "invented-id",
@@ -133,7 +158,7 @@ async def test_exceptional_entry_ignores_model_supplied_time_type_and_ids(
         response_language="en",
     )
 
-    assert intent.validated_arguments["entry_time"] == "2026-09-16T17:30:00"
+    assert intent.validated_arguments["entry_time"] == "16/09/2026 17:30"
     assert intent.validated_arguments["entry_type"] == 2
     assert intent.validated_arguments["reason_id"] == "reason-live"
 
@@ -145,9 +170,6 @@ async def test_exceptional_entry_without_suggestion_is_clear_and_never_prepared(
 ) -> None:
     writes = []
 
-    async def attendance(*args, **kwargs):
-        return {"Days": [{"Date": "10/09/2026", "LessHrs": "01:20"}]}
-
     async def suggestions(*args, **kwargs):
         return []
 
@@ -157,7 +179,6 @@ async def test_exceptional_entry_without_suggestion_is_clear_and_never_prepared(
     async def submit(**kwargs):
         writes.append(kwargs)
 
-    monkeypatch.setattr(actions, "get_attendance_summary", attendance)
     monkeypatch.setattr(actions, "get_missing_punch_suggestions", suggestions)
     monkeypatch.setattr(actions, "get_exception_reasons", reasons)
     monkeypatch.setattr(actions, "create_exceptional_entry", submit)
@@ -175,6 +196,7 @@ async def test_exceptional_entry_without_suggestion_is_clear_and_never_prepared(
         lang=1,
         session_id=session_id,
         response_language="en",
+        source_user_message="Traffic caused the missing punch",
         store=store,
     )
 
@@ -184,29 +206,37 @@ async def test_exceptional_entry_without_suggestion_is_clear_and_never_prepared(
     assert store.get_pending_action(session_id)[0] is None
     assert body["prepared"] is False
     assert body["requires_clarification"] is False
-    assert "doesn't currently provide a suggested punch correction" in body["message"]
+    assert "does not currently provide a valid suggested punch correction" in body[
+        "message"
+    ]
     assert "selected punch time" not in body["message"]
     assert writes == []
     assert "category=no_resourceplus_suggestion" in caplog.text
 
 
 @pytest.mark.asyncio
-async def test_multiple_less_hours_days_require_date_selection(monkeypatch) -> None:
-    async def attendance(*args, **kwargs):
-        return {
-            "Days": [
-                {"Date": "10/09/2026", "LessHrs": "01:20"},
-                {"Date": "16/09/2026", "LessHrs": "00:45"},
-            ]
-        }
-
+async def test_multiple_suggestion_dates_require_date_selection(monkeypatch) -> None:
     async def suggestions(*args, **kwargs):
-        raise AssertionError("A date must be selected before requesting suggestions")
+        return [
+            {
+                "attDate": "10/09/2026",
+                "suggestedEntryTime": "10/09/2026 09:00",
+                "entryType": "IN",
+            },
+            {
+                "attDate": "16/09/2026",
+                "suggestedEntryTime": "16/09/2026 17:00",
+                "entryType": "OUT",
+            },
+        ]
 
-    monkeypatch.setattr(actions, "get_attendance_summary", attendance)
+    async def reasons(*args, **kwargs):
+        raise AssertionError("Reasons require a clearly selected suggestion")
+
     monkeypatch.setattr(actions, "get_missing_punch_suggestions", suggestions)
+    monkeypatch.setattr(actions, "get_exception_reasons", reasons)
     store = InMemorySessionStore()
-    session_id = store.ensure_session("multiple-less-hours")
+    session_id = store.ensure_session("multiple-suggestions")
 
     result = await execute_tool(
         "prepare_exceptional_entry",
@@ -230,50 +260,161 @@ async def test_multiple_less_hours_days_require_date_selection(monkeypatch) -> N
     assert result.pending_action is None
     assert store.get_pending_action(session_id)[0] is None
     assert body["requires_clarification"] is True
-    assert "10 September 2026 — 1h 20m" in body["message"]
-    assert "16 September 2026 — 45m" in body["message"]
+    assert "10 September 2026" in body["message"]
+    assert "16 September 2026" in body["message"]
     assert "Which date" in body["message"]
 
 
 @pytest.mark.asyncio
-async def test_non_less_hours_date_never_requests_a_suggestion(monkeypatch) -> None:
-    async def attendance(*args, **kwargs):
-        return {"Days": [{"Date": "10/09/2026", "LessHrs": "00:00"}]}
-
+async def test_live_suggestion_is_authoritative_without_attendance_prefilter(
+    monkeypatch,
+) -> None:
     async def suggestions(*args, **kwargs):
-        raise AssertionError("An inapplicable attendance day must stop before suggestions")
+        return [
+            {
+                "attDate": "10/09/2026",
+                "suggestedEntryTime": "10/09/2026 09:07",
+                "entryType": "IN",
+                "shift": "Night Shift",
+                "isNightShift": 1,
+            }
+        ]
 
-    monkeypatch.setattr(actions, "get_attendance_summary", attendance)
+    async def reasons(*args, **kwargs):
+        return [{"reasonID": "traffic-live", "reasonName": "Traffic Delay"}]
+
     monkeypatch.setattr(actions, "get_missing_punch_suggestions", suggestions)
+    monkeypatch.setattr(actions, "get_exception_reasons", reasons)
     store = InMemorySessionStore()
-    session_id = store.ensure_session("not-applicable")
+    session_id = store.ensure_session("authoritative-suggestion")
 
     result = await execute_tool(
         "prepare_exceptional_entry",
         {
             "target_date": "2026-09-10",
-            "reason_name": "Family circumstance",
-            "remarks": "Family circumstance",
+            "reason_name": "traffic",
+            "remarks": "Traffic delay",
         },
         lang=1,
         session_id=session_id,
         response_language="en",
+        source_user_message="traffic",
+        store=store,
+    )
+
+    assert result.pending_action is not None
+    pending, expired = store.get_pending_action(session_id)
+    assert expired is False
+    assert pending is not None
+    assert pending.validated_arguments == {
+        "entry_time": "10/09/2026 09:07",
+        "entry_type": 1,
+        "reason_id": "traffic-live",
+        "reason_name": "Traffic Delay",
+        "remarks": "Traffic delay",
+        "attendance_date": "2026-09-10",
+        "shift": "Night Shift",
+        "is_night_shift": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_selected_date_uses_only_its_resourceplus_suggestion(monkeypatch) -> None:
+    async def suggestions(*args, **kwargs):
+        return [
+            {
+                "attDate": "09/09/2026",
+                "suggestedEntryTime": "09/09/2026 09:15",
+                "entryType": "IN",
+            },
+            {
+                "attDate": "10/09/2026",
+                "suggestedEntryTime": "10/09/2026 17:11",
+                "entryType": "OUT",
+            },
+        ]
+
+    async def reasons(*args, **kwargs):
+        return [{"reasonID": "client-live", "reasonName": "Client Meeting"}]
+
+    monkeypatch.setattr(actions, "get_missing_punch_suggestions", suggestions)
+    monkeypatch.setattr(actions, "get_exception_reasons", reasons)
+
+    intent = await prepare_write_action(
+        "prepare_exceptional_entry",
+        {
+            "target_date": "2026-09-10",
+            "reason_name": "client meeting",
+            "remarks": "Client meeting",
+            "_user_message": "Client meeting",
+        },
+        lang=1,
+        response_language="en",
+    )
+
+    assert intent.validated_arguments["attendance_date"] == "2026-09-10"
+    assert intent.validated_arguments["entry_time"] == "10/09/2026 17:11"
+    assert intent.validated_arguments["entry_type"] == 2
+    assert intent.validated_arguments["reason_id"] == "client-live"
+
+
+@pytest.mark.asyncio
+async def test_unknown_live_reason_requires_clarification_without_pending_action(
+    monkeypatch,
+) -> None:
+    async def suggestions(*args, **kwargs):
+        return [
+            {
+                "attDate": "10/09/2026",
+                "suggestedEntryTime": "10/09/2026 17:00",
+                "entryType": "OUT",
+            }
+        ]
+
+    async def reasons(*args, **kwargs):
+        return [{"reasonID": "traffic-secret", "reasonName": "Traffic Delay"}]
+
+    async def no_match(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(actions, "get_missing_punch_suggestions", suggestions)
+    monkeypatch.setattr(actions, "get_exception_reasons", reasons)
+    monkeypatch.setattr(actions, "match_live_reason", no_match)
+    store = InMemorySessionStore()
+    session_id = store.ensure_session("unknown-reason")
+
+    result = await execute_tool(
+        "prepare_exceptional_entry",
+        {
+            "target_date": "2026-09-10",
+            "reason_name": "unsupported reason",
+            "remarks": "Unsupported reason",
+        },
+        lang=1,
+        session_id=session_id,
+        response_language="en",
+        source_user_message="unsupported reason",
         store=store,
     )
 
     body = json.loads(result.output)
     assert result.pending_action is None
-    assert "couldn't find an applicable less-hours record" in body["message"]
     assert store.get_pending_action(session_id)[0] is None
+    assert body["requires_clarification"] is True
+    assert "Traffic Delay" in body["message"]
+    assert "traffic-secret" not in result.output
 
 
 @pytest.mark.asyncio
 async def test_ambiguous_live_reason_asks_user_without_exposing_ids(monkeypatch) -> None:
-    async def attendance(*args, **kwargs):
-        return {"Days": [{"Date": "10/09/2026", "LessHrs": "01:20"}]}
-
     async def suggestions(*args, **kwargs):
-        return [{"suggestedEntryTime": "10/09/2026 17:00", "entryType": "OUT"}]
+        return [
+            {
+                "attDate": "10/09/2026",
+                "suggestedEntryTime": "10/09/2026 17:00",
+                "entryType": "OUT",
+            }
+        ]
 
     async def reasons(*args, **kwargs):
         return [
@@ -284,7 +425,6 @@ async def test_ambiguous_live_reason_asks_user_without_exposing_ids(monkeypatch)
     async def ambiguous(*args, **kwargs):
         return None
 
-    monkeypatch.setattr(actions, "get_attendance_summary", attendance)
     monkeypatch.setattr(actions, "get_missing_punch_suggestions", suggestions)
     monkeypatch.setattr(actions, "get_exception_reasons", reasons)
     monkeypatch.setattr(actions, "match_live_reason", ambiguous)
@@ -301,6 +441,7 @@ async def test_ambiguous_live_reason_asks_user_without_exposing_ids(monkeypatch)
         lang=1,
         session_id=session_id,
         response_language="en",
+        source_user_message="family issue",
         store=store,
     )
 
@@ -317,12 +458,10 @@ async def test_ambiguous_live_reason_asks_user_without_exposing_ids(monkeypatch)
 async def test_exceptional_entry_yes_executes_exact_pending_arguments(
     monkeypatch,
 ) -> None:
-    async def attendance(*args, **kwargs):
-        return {"Days": [{"Date": "10/09/2026", "LessHrs": "01:20"}]}
-
     async def suggestions(*args, **kwargs):
         return [
             {
+                "attDate": "10/09/2026",
                 "suggestedEntryTime": "10/09/2026 17:00",
                 "entryType": "OUT",
             }
@@ -331,7 +470,6 @@ async def test_exceptional_entry_yes_executes_exact_pending_arguments(
     async def reasons(*args, **kwargs):
         return [{"reasonID": "family-live-id", "reasonName": "Family Circumstances"}]
 
-    monkeypatch.setattr(actions, "get_attendance_summary", attendance)
     monkeypatch.setattr(actions, "get_missing_punch_suggestions", suggestions)
     monkeypatch.setattr(actions, "get_exception_reasons", reasons)
     store = InMemorySessionStore()
@@ -346,6 +484,7 @@ async def test_exceptional_entry_yes_executes_exact_pending_arguments(
         lang=1,
         session_id=session_id,
         response_language="en",
+        source_user_message="family circumstance",
         store=store,
     )
     pending = prepared.pending_action
@@ -377,11 +516,14 @@ async def test_exceptional_entry_yes_executes_exact_pending_arguments(
         (
             "create_exceptional_entry",
             {
-                "entry_time": "2026-09-10T17:00:00",
+                "entry_time": "10/09/2026 17:00",
                 "entry_type": 2,
                 "reason_id": "family-live-id",
                 "reason_name": "Family Circumstances",
                 "remarks": "Family circumstance",
+                "attendance_date": "2026-09-10",
+                "shift": None,
+                "is_night_shift": None,
             },
         )
     ]
@@ -395,7 +537,7 @@ async def test_exceptional_entry_no_discards_without_write(monkeypatch) -> None:
         session_id,
         action_type="create_exceptional_entry",
         validated_arguments={
-            "entry_time": "2026-09-10T17:00:00",
+            "entry_time": "10/09/2026 17:00",
             "entry_type": 2,
             "reason_id": "family-live-id",
             "reason_name": "Family Circumstances",
@@ -422,6 +564,51 @@ async def test_exceptional_entry_no_discards_without_write(monkeypatch) -> None:
     assert response.success is True
     assert response.language == "en"
     assert store.get_pending_action(session_id)[0] is None
+
+
+@pytest.mark.asyncio
+async def test_expired_exceptional_entry_never_posts(monkeypatch) -> None:
+    now = [datetime(2026, 9, 22, tzinfo=timezone.utc)]
+    store = InMemorySessionStore(
+        confirmation_ttl_seconds=1,
+        now=lambda: now[0],
+    )
+    session_id = store.ensure_session("exceptional-expired")
+    store.create_pending_action(
+        session_id,
+        action_type="create_exceptional_entry",
+        validated_arguments={
+            "entry_time": "10/09/2026 17:00",
+            "entry_type": 2,
+            "reason_id": "family-live-id",
+            "reason_name": "Family Circumstances",
+            "remarks": "Family circumstance",
+            "attendance_date": "10/09/2026",
+            "shift": None,
+            "is_night_shift": 0,
+        },
+        summary="Confirm exceptional entry",
+        language="en",
+    )
+    now[0] += timedelta(seconds=2)
+
+    async def execute(*args, **kwargs):
+        raise AssertionError("An expired exceptional entry must never be posted")
+
+    async def classify(*args, **kwargs):
+        raise AssertionError("An expired action must not be classified")
+
+    monkeypatch.setattr(chat_service, "execute_pending_action", execute)
+    monkeypatch.setattr(chat_service, "classify_confirmation_intent", classify)
+    response = await chat_service.process_chat(
+        ChatRequest(message="Yes", session_id=session_id),
+        detected_language="en",
+        store=store,
+    )
+
+    assert response.success is False
+    assert response.requires_confirmation is False
+    assert "expired" in response.message.lower()
 
 
 @pytest.mark.asyncio
@@ -833,11 +1020,16 @@ def test_openai_tools_cannot_choose_identity_or_resourceplus_ids() -> None:
     )
     assert set(exceptional["parameters"]["properties"]) == {
         "target_date",
+        "punch_direction",
         "reason_name",
         "remarks",
     }
     assert "entry_time" not in exceptional["parameters"]["properties"]
     assert "entry_type" not in exceptional["parameters"]["properties"]
+    assert exceptional["parameters"]["properties"]["reason_name"]["type"] == [
+        "string",
+        "null",
+    ]
 
     assert "create_exceptional_entry" not in ALLOWED_TOOL_NAMES
     assert "book_day_type" not in ALLOWED_TOOL_NAMES

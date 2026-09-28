@@ -16,15 +16,27 @@ class ChatRequest(BaseModel):
         return value
 
 
+class ReasonOption(BaseModel):
+    label: str
+    value: str
+
+
 class ChatResponse(BaseModel):
     success: bool
     message: str
+    display_message: str | None = None
     language: str
     tools_used: list[str] = Field(default_factory=list)
     session_id: str
     requires_confirmation: bool = False
     confirmation_id: str | None = None
+    needs_reason: bool = False
+    reason_options: list[ReasonOption] | None = None
     _speech_message: str | None = PrivateAttr(default=None)
+
+    def model_post_init(self, __context: object) -> None:
+        if self.display_message is None:
+            self.display_message = self.message
 
     @property
     def speech_message(self) -> str | None:

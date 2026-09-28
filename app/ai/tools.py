@@ -21,6 +21,10 @@ from app.resourceplus.home import get_home_data
 from app.resourceplus.leave import get_day_types
 from app.resourceplus.notifications import get_notifications
 from app.resourceplus.requests import get_my_request_status
+from app.resourceplus.missing_punch import (
+    missing_punch_tool_data,
+    normalize_missing_punch_suggestions,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -85,8 +89,9 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "type": "function",
         "name": "get_missing_punch_suggestions",
         "description": (
-            "Get ResourcePlus-authoritative missing IN/OUT punch suggestions and "
-            "suggested times for an inclusive date range."
+            "Get ResourcePlus-reported missing IN/OUT punches grouped by date, with "
+            "a separate correctable-suggestions collection. A missing punch remains "
+            "visible when its suggested correction time is unavailable."
         ),
         "parameters": _date_range_schema(),
         "strict": True,
@@ -139,9 +144,12 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "name": "prepare_exceptional_entry",
         "description": (
             "Prepare, but do not submit, a less-hours exceptional-entry correction. "
-            "Provide the intended date and the employee's natural reason. The backend "
-            "re-reads attendance, the ResourcePlus punch suggestion, and live reasons; "
-            "it alone selects the exact time, punch type, and reason ID."
+            "Call this directly for a correction request; do not prefetch suggestions "
+            "or reasons. The backend reads suggestions once, resolves one exact punch, "
+            "then reads live reasons only when an actionable suggestion exists. Call "
+            "with a null reason when the employee has not supplied one; never ask for "
+            "a reason before this tool verifies actionability. Provide IN or OUT only "
+            "when the employee selected that direction after a clarification."
         ),
         "parameters": {
             "type": "object",
@@ -153,19 +161,36 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                         "employee has not selected one."
                     ),
                 },
-                "reason_name": {
-                    "type": "string",
+                "punch_direction": {
+                    "type": ["string", "null"],
+                    "enum": ["IN", "OUT", None],
                     "description": (
-                        "The employee's natural-language reason. Do not invent or "
-                        "supply a ResourcePlus reason ID."
+                        "IN or OUT only when the employee explicitly selected one; "
+                        "otherwise null. This never supplies the correction time."
+                    ),
+                },
+                "reason_name": {
+                    "type": ["string", "null"],
+                    "description": (
+                        "The employee's exact natural-language reason from this turn, "
+                        "or null when none was supplied. Never infer a default and do "
+                        "not supply a ResourcePlus reason ID."
                     ),
                 },
                 "remarks": {
-                    "type": "string",
-                    "description": "The employee's own requested remarks; do not invent facts.",
+                    "type": ["string", "null"],
+                    "description": (
+                        "The employee's own requested remarks, or null when none were "
+                        "supplied; do not invent facts."
+                    ),
                 },
             },
-            "required": ["target_date", "reason_name", "remarks"],
+            "required": [
+                "target_date",
+                "punch_direction",
+                "reason_name",
+                "remarks",
+            ],
             "additionalProperties": False,
         },
         "strict": True,
@@ -318,6 +343,9 @@ class ToolExecutionResult:
     output: str
     failed: bool = False
     pending_action: PendingAction | None = None
+    terminal_message: str | None = None
+    needs_reason: bool = False
+    reason_options: list[str] | None = None
 
 
 def resolve_relative_date_range(
@@ -427,6 +455,7 @@ async def execute_tool(
     session_id: str,
     response_language: str,
     resolved_range: DateRange | None = None,
+    source_user_message: str | None = None,
     store: SessionStore = session_store,
 ) -> ToolExecutionResult:
     if name not in ALLOWED_TOOL_NAMES:
@@ -446,7 +475,11 @@ async def execute_tool(
             data = await get_profile_data(lang=lang)
         elif name == "get_missing_punch_suggestions":
             start, end = _tool_dates(name, arguments, resolved_range)
-            data = await get_missing_punch_suggestions(start, end, lang=lang)
+            data = missing_punch_tool_data(
+                normalize_missing_punch_suggestions(
+                    await get_missing_punch_suggestions(start, end, lang=lang)
+                )
+            )
         elif name == "get_exception_reasons":
             data = await get_exception_reasons(lang=lang)
         elif name == "get_day_types":
@@ -462,6 +495,8 @@ async def execute_tool(
             )
         else:
             intent_arguments = dict(arguments)
+            if name == "prepare_exceptional_entry" and source_user_message is not None:
+                intent_arguments["_user_message"] = source_user_message
             if resolved_range and name == "prepare_exceptional_entry":
                 intent_arguments["_range_from"] = resolved_range.from_date.isoformat()
                 intent_arguments["_range_to"] = resolved_range.to_date.isoformat()
@@ -512,16 +547,41 @@ async def execute_tool(
             "EXCEPTIONAL_ENTRY_RESOLUTION category=%s",
             exc.category,
         )
+        if exc.category == "no_resourceplus_suggestion":
+            record_safe_error(exc.category)
+        if exc.category == "reason_required" and exc.draft_context is not None:
+            store.create_exceptional_entry_draft(
+                session_id,
+                attendance_date=exc.draft_context["attendance_date"],
+                entry_type=exc.draft_context["entry_type"],
+                suggested_entry_time=exc.draft_context["suggested_entry_time"],
+                language=exc.draft_context["language"],
+            )
+        needs_reason = exc.category in {
+            "reason_required",
+            "reason_unknown",
+            "reason_ambiguous",
+        }
+        reason_options = [
+            {"label": name, "value": name}
+            for name in (exc.reason_options or [])
+        ]
         return ToolExecutionResult(
             json.dumps(
                 {
                     "success": True,
                     "prepared": False,
+                    "requires_confirmation": False,
                     "requires_clarification": exc.requires_clarification,
+                    "needs_reason": needs_reason,
+                    "reason_options": reason_options,
                     "message": str(exc),
                 },
                 ensure_ascii=False,
-            )
+            ),
+            terminal_message=str(exc),
+            needs_reason=needs_reason,
+            reason_options=list(exc.reason_options or []),
         )
     except ResourcePlusError as exc:
         record_safe_error("resourceplus_error")
@@ -536,6 +596,16 @@ async def execute_tool(
             failed=True,
         )
 
+    payload: dict[str, Any] = {"success": True, "data": data}
+    if name == "get_attendance_summary":
+        payload["attendance_semantics"] = {
+            "NetHrs": "time actually worked",
+            "LessHrs": "shortfall from required working hours",
+            "speech_rule": (
+                "State actual worked time and the shortfall as separate quantities; "
+                "never describe NetHrs as the amount worked less than expected."
+            ),
+        }
     return ToolExecutionResult(
-        json.dumps({"success": True, "data": data}, ensure_ascii=False, default=str)
+        json.dumps(payload, ensure_ascii=False, default=str)
     )

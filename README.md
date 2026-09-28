@@ -171,8 +171,8 @@ Project source, `.env`, `data/`, audit databases, and logs are never static root
   compatible `/api/voice/chat` endpoint if streaming cannot start or finalize. A
   pending confirmation is never automatically retried through the fallback path.
 - Voice answers use a concise spoken rendering of the authoritative on-screen answer.
-  Returned base64 audio is decoded to a Blob URL, played once when browser policy
-  permits, and can be replayed from the assistant message.
+  Returned base64 audio is decoded using `audio_mime_type` to a Blob URL, played once
+  when browser policy permits, and can be replayed from the assistant message.
 
 Microphone access requires a secure context. Loopback origins such as `127.0.0.1`
 and `localhost` are treated as secure by current desktop browsers. Autoplay policy
@@ -205,13 +205,16 @@ The confirmation ID is optional only when a session has exactly one current pend
 action, but clients should always return it. A `Yes` without a pending action never
 executes anything.
 
-Voice requests use `multipart/form-data` at `POST /api/voice/chat` with:
+The complete HTTP fallback and WebSocket frontend contract is documented in
+[Voice Chat API](docs/VOICE_CHAT_API.md).
+
+Voice fallback requests use `multipart/form-data` at `POST /api/voice/chat` with:
 
 - `audio`: PCM WAV file (required)
 - `session_id`: current session when present
 - `confirmation_id`: current pending confirmation when present
 
-Streaming voice uses `WS /api/voice/stream`:
+Streaming voice uses `WS /api/voice/stream`. In summary:
 
 1. Client sends `{"type":"start","sample_rate":16000}` with optional session and
    confirmation references.
@@ -276,6 +279,11 @@ status, manager approvals, and notifications. Confirmed write operations include
 exceptional entries, day-type booking/cancellation, supervisor approvals, and
 notification read status. There are no public write-debug endpoints, and automated
 tests mock all ResourcePlus writes.
+
+The exceptional-entry contract is documented in
+[Exceptional-entry flow](docs/EXCEPTIONAL_ENTRY_FLOW.md):
+`MissingPunchSuggestions` -> `ExceptionalEntries/Reasons` -> immutable
+`PendingAction` confirmation -> `ExceptionalEntries/Request`.
 
 ## Current POC limitations
 

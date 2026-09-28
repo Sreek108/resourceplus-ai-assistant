@@ -1,6 +1,10 @@
 import re
 
-from app.ai.actions import execute_pending_action
+from app.ai.actions import (
+    ActionResolutionRequired,
+    execute_pending_action,
+    prepare_exceptional_entry_reason_follow_up,
+)
 from app.ai.agent import (
     AgentResult,
     OpenAIServiceError,
@@ -15,9 +19,10 @@ from app.ai.sessions import (
     SessionStore,
     session_store,
 )
-from app.audit import record_action_state, record_safe_error
+from app.audit import record_action_state, record_safe_error, record_tool_usage
 from app.config import get_settings
 from app.models.schemas import ChatRequest, ChatResponse
+from app.resourceplus import ResourcePlusError
 from app.speech.language import count_script_letters
 
 
@@ -58,10 +63,117 @@ CONFIRMATION_MESSAGES = {
     },
 }
 
+DRAFT_CANCELLATIONS = {
+    "cancel",
+    "cancel it",
+    "never mind",
+    "nevermind",
+    "leave it",
+    "stop",
+    "إلغاء",
+    "الغاء",
+    "خلاص",
+    "اتركه",
+}
+DRAFT_GREETINGS = {
+    "hello",
+    "hi",
+    "hey",
+    "good morning",
+    "good afternoon",
+    "good evening",
+    "مرحبا",
+    "أهلا",
+    "اهلا",
+    "السلام عليكم",
+}
+DRAFT_TOPIC_STARTERS = {
+    "show",
+    "what",
+    "how",
+    "when",
+    "where",
+    "who",
+    "can",
+    "could",
+    "would",
+    "tell",
+    "check",
+    "أرني",
+    "ارني",
+    "ورني",
+    "وش",
+    "ماذا",
+    "كيف",
+    "كم",
+    "هل",
+}
+
+ACTION_RESULT_MESSAGES = {
+    "create_exceptional_entry": {
+        "submitted_for_approval": {
+            "en": {
+                "display": "Your exceptional-entry request was submitted successfully for approval.",
+                "speech": "Your exceptional-entry request was submitted for approval successfully.",
+            },
+            "ar": {
+                "display": "تم إرسال طلب الإدخال الاستثنائي للموافقة بنجاح.",
+                "speech": "تم إرسال طلب الإدخال الاستثنائي للموافقة بنجاح.",
+            },
+        },
+        "failed": {
+            "en": {
+                "display": (
+                    "ResourcePlus could not submit the exceptional-entry request. "
+                    "The request was not recorded."
+                ),
+                "speech": (
+                    "ResourcePlus couldn't submit your exceptional-entry request, "
+                    "so it wasn't recorded."
+                ),
+            },
+            "ar": {
+                "display": (
+                    "تعذّر على ResourcePlus إرسال طلب الإدخال الاستثنائي. "
+                    "لم يتم تسجيل الطلب."
+                ),
+                "speech": (
+                    "ما قدر ResourcePlus يرسل طلب الإدخال الاستثنائي، "
+                    "وعشان كذا الطلب ما تسجّل."
+                ),
+            },
+        },
+    }
+}
+
 
 def _normalized_reply(message: str) -> str:
     normalized = re.sub(r"[,.!?،؟]+", "", message.strip().casefold())
     return re.sub(r"\s+", " ", normalized)
+
+
+def _draft_follow_up_kind(message: str) -> str:
+    """Conservatively separate a short reason phrase from clear topic changes."""
+
+    normalized = _normalized_reply(message)
+    if normalized in DRAFT_CANCELLATIONS:
+        return "cancel"
+    if normalized in DRAFT_GREETINGS:
+        return "topic_change"
+    words = re.findall(r"[^\W_]+", message, flags=re.UNICODE)
+    if not words:
+        return "topic_change"
+    if words[0].casefold() in DRAFT_TOPIC_STARTERS:
+        return "topic_change"
+    if "?" in message or "؟" in message or len(words) > 6:
+        return "topic_change"
+    return "reason"
+
+
+def _draft_cancelled_message(language: str) -> str:
+    if language == "ar":
+        return "تم إلغاء مسودة طلب الإدخال الاستثنائي. لم يتم إرسال أي طلب."
+    return "The exceptional-entry draft was cancelled. Nothing was submitted."
 
 
 def _unambiguous_english_decision(message: str, language: str) -> str:
@@ -126,6 +238,23 @@ def _safe_action_result(action_type: str, success: bool) -> str:
     return "succeeded"
 
 
+def _deterministic_action_result(
+    action_type: str,
+    action_result: str,
+    language: str,
+) -> tuple[str, str] | None:
+    """Render known write outcomes without trusting upstream response language."""
+
+    action_messages = ACTION_RESULT_MESSAGES.get(action_type)
+    if action_messages is None:
+        return None
+    result_messages = action_messages.get(action_result)
+    if result_messages is None:
+        return None
+    localized = result_messages[language if language in {"en", "ar"} else "en"]
+    return localized["display"], localized["speech"]
+
+
 async def _confirmation_decision(
     message: str,
     *,
@@ -173,6 +302,7 @@ async def process_chat(
     lang = request.lang or get_settings().rp_default_lang
     session_id = store.ensure_session(request.session_id)
     language = detected_language or detect_language(request.message)
+    ignore_prior_history_for_topic_change = False
     pending, expired = store.get_pending_action(session_id)
     expired_action_type = (
         store.get_expired_pending_action_type(session_id) if expired else None
@@ -258,6 +388,32 @@ async def process_chat(
                 action.action_type,
                 action.validated_arguments,
             )
+        except ResourcePlusError:
+            record_action_state(
+                action_type=action.action_type,
+                state="failed",
+                confirmation_required=False,
+                confirmed=True,
+                result="failed",
+            )
+            record_safe_error("resourceplus_error")
+            deterministic_result = _deterministic_action_result(
+                action.action_type,
+                "failed",
+                flow_language,
+            )
+            if deterministic_result is None:
+                raise
+            message, speech_message = deterministic_result
+            store.append_history(session_id, "user", request.message)
+            store.append_history(session_id, "assistant", message)
+            return ChatResponse(
+                success=False,
+                message=message,
+                language=flow_language,
+                tools_used=[action.action_type],
+                session_id=session_id,
+            ).set_speech_message(speech_message)
         except Exception:
             record_action_state(
                 action_type=action.action_type,
@@ -268,19 +424,29 @@ async def process_chat(
             )
             raise
         success, source_message = _response_message(operation_result)
+        action_result = _safe_action_result(action.action_type, success)
         record_action_state(
             action_type=action.action_type,
             state="executed" if success else "failed",
             confirmation_required=False,
             confirmed=True,
-            result=_safe_action_result(action.action_type, success),
+            result=action_result,
         )
-        message = await _render_or_fallback(
-            source_message,
-            language=flow_language,
-            purpose="report the confirmed ResourcePlus operation result",
-            fallback=source_message,
+        deterministic_result = _deterministic_action_result(
+            action.action_type,
+            action_result,
+            flow_language,
         )
+        if deterministic_result is None:
+            message = await _render_or_fallback(
+                source_message,
+                language=flow_language,
+                purpose="report the confirmed ResourcePlus operation result",
+                fallback=source_message,
+            )
+            speech_message = message
+        else:
+            message, speech_message = deterministic_result
         store.append_history(session_id, "user", request.message)
         store.append_history(session_id, "assistant", message)
         return ChatResponse(
@@ -289,7 +455,7 @@ async def process_chat(
             language=flow_language,
             tools_used=[action.action_type],
             session_id=session_id,
-        ).set_speech_message(message)
+        ).set_speech_message(speech_message)
 
     if pending is not None and decision == "REJECT":
         store.discard_pending_action(session_id)
@@ -329,6 +495,117 @@ async def process_chat(
             confirmation_id=pending.confirmation_id,
         ).set_speech_message(message)
 
+    draft = store.get_exceptional_entry_draft(session_id)
+    if draft is not None:
+        draft_follow_up = _draft_follow_up_kind(request.message)
+        if draft_follow_up == "cancel":
+            store.clear_exceptional_entry_draft(session_id)
+            message = _draft_cancelled_message(draft.language)
+            store.append_history(session_id, "user", request.message)
+            store.append_history(session_id, "assistant", message)
+            return ChatResponse(
+                success=True,
+                message=message,
+                language=draft.language,
+                session_id=session_id,
+            ).set_speech_message(message)
+        if draft_follow_up == "reason":
+            record_tool_usage("prepare_exceptional_entry")
+            try:
+                intent = await prepare_exceptional_entry_reason_follow_up(
+                    attendance_date=draft.attendance_date,
+                    entry_type=draft.entry_type,
+                    suggested_entry_time=draft.suggested_entry_time,
+                    reason_text=request.message,
+                    lang=lang,
+                    response_language=draft.language,
+                )
+            except ActionResolutionRequired as exc:
+                if exc.category == "draft_stale":
+                    store.clear_exceptional_entry_draft(session_id)
+                message = str(exc)
+                store.append_history(session_id, "user", request.message)
+                store.append_history(session_id, "assistant", message)
+                return ChatResponse(
+                    success=True,
+                    message=message,
+                    language=draft.language,
+                    tools_used=["prepare_exceptional_entry"],
+                    session_id=session_id,
+                    needs_reason=exc.category in {
+                        "reason_unknown",
+                        "reason_ambiguous",
+                    },
+                    reason_options=[
+                        {"label": name, "value": name}
+                        for name in (exc.reason_options or [])
+                    ] or None,
+                ).set_speech_message(message)
+            except ResourcePlusError:
+                record_safe_error("resourceplus_error")
+                message = (
+                    "تعذر التحقق من بيانات ResourcePlus الآن. حاول مرة أخرى."
+                    if draft.language == "ar"
+                    else (
+                        "I couldn't verify the ResourcePlus data right now. "
+                        "Please try again."
+                    )
+                )
+                return ChatResponse(
+                    success=False,
+                    message=message,
+                    language=draft.language,
+                    tools_used=["prepare_exceptional_entry"],
+                    session_id=session_id,
+                ).set_speech_message(message)
+            except (ValueError, TypeError, KeyError):
+                record_safe_error("validation_error")
+                message = (
+                    "تعذر التحقق من بيانات التصحيح الآن. حاول مرة أخرى."
+                    if draft.language == "ar"
+                    else (
+                        "I couldn't validate the correction data right now. "
+                        "Please try again."
+                    )
+                )
+                return ChatResponse(
+                    success=False,
+                    message=message,
+                    language=draft.language,
+                    tools_used=["prepare_exceptional_entry"],
+                    session_id=session_id,
+                ).set_speech_message(message)
+            pending_action = store.create_pending_action(
+                session_id,
+                action_type=intent.action_type,
+                validated_arguments=intent.validated_arguments,
+                summary=intent.summary,
+                language=intent.language,
+            )
+            record_action_state(
+                action_type=intent.action_type,
+                state="pending_confirmation",
+                confirmation_required=True,
+                confirmed=False,
+            )
+            message = intent.summary
+            store.append_history(session_id, "user", request.message)
+            store.append_history(session_id, "assistant", message)
+            return ChatResponse(
+                success=True,
+                message=message,
+                language=draft.language,
+                tools_used=["prepare_exceptional_entry"],
+                session_id=session_id,
+                requires_confirmation=True,
+                confirmation_id=pending_action.confirmation_id,
+            ).set_speech_message(message)
+
+        # An explicit topic change abandons this non-executable draft so it cannot
+        # hijack later turns. The ordinary agent remains responsible for the new topic.
+        store.clear_exceptional_entry_draft(session_id)
+        ignore_prior_history_for_topic_change = True
+
     if expired or decision in {"CONFIRM", "REJECT"}:
         message = _confirmation_message(
             "expired" if expired else "missing",
@@ -345,7 +622,11 @@ async def process_chat(
         request.message,
         lang=lang,
         session_id=session_id,
-        history=store.get_history(session_id),
+        history=(
+            []
+            if ignore_prior_history_for_topic_change
+            else store.get_history(session_id)
+        ),
         response_language=language,
     )
     store.append_history(session_id, "user", request.message)
@@ -367,4 +648,9 @@ async def process_chat(
         session_id=session_id,
         requires_confirmation=result.requires_confirmation,
         confirmation_id=result.confirmation_id,
+        needs_reason=result.needs_reason,
+        reason_options=[
+            {"label": name, "value": name}
+            for name in (result.reason_options or [])
+        ] or None,
     ).set_speech_message(result.speech_message)

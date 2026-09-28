@@ -54,6 +54,8 @@ class AgentResult:
     requires_confirmation: bool = False
     confirmation_id: str | None = None
     speech_message: str | None = None
+    needs_reason: bool = False
+    reason_options: list[str] | None = None
 
 
 def _assistant_messages(output_text: str) -> tuple[str, str | None]:
@@ -168,11 +170,21 @@ async def run_agent(
                             session_id=session_id,
                             response_language=response_language,
                             resolved_range=resolved_range,
+                            source_user_message=message,
                         )
                         result_output = result.output
                         failed = result.failed
                         if result.pending_action is not None:
                             pending_action = result.pending_action
+                        if result.terminal_message is not None:
+                            return AgentResult(
+                                message=result.terminal_message,
+                                tools_used=tools_used,
+                                tool_failed=failed,
+                                speech_message=result.terminal_message,
+                                needs_reason=result.needs_reason,
+                                reason_options=result.reason_options,
+                            )
                 tool_failed = tool_failed or failed
                 input_items.append(
                     {

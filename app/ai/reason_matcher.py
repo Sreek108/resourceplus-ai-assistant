@@ -2,7 +2,9 @@ import json
 import logging
 import re
 import unicodedata
+from dataclasses import dataclass
 from difflib import SequenceMatcher
+from typing import Literal
 
 from openai import AsyncOpenAI, OpenAIError
 
@@ -28,6 +30,12 @@ REASON_SELECTION_TEXT_CONFIG = {
 }
 
 
+@dataclass(frozen=True)
+class DeterministicReasonMatch:
+    status: Literal["matched", "ambiguous", "unknown"]
+    index: int | None = None
+
+
 def _tokens(value: str) -> tuple[str, ...]:
     normalized = unicodedata.normalize("NFKC", value).casefold()
     tokens = re.findall(r"[^\W_]+", normalized, flags=re.UNICODE)
@@ -41,10 +49,13 @@ def _tokens(value: str) -> tuple[str, ...]:
     return tuple(result)
 
 
-def _deterministic_match(query: str, options: list[str]) -> int | None:
+def deterministic_reason_match(
+    query: str,
+    options: list[str],
+) -> DeterministicReasonMatch:
     query_tokens = _tokens(query)
-    if not query_tokens:
-        return None
+    if not query_tokens or not options:
+        return DeterministicReasonMatch("unknown")
     query_set = set(query_tokens)
     scores: list[tuple[float, int]] = []
     for index, option in enumerate(options):
@@ -69,8 +80,10 @@ def _deterministic_match(query: str, options: list[str]) -> int | None:
     best_score, best_index = scores[0]
     next_score = scores[1][0] if len(scores) > 1 else 0.0
     if best_score >= 0.5 and best_score - next_score >= 0.15:
-        return best_index
-    return None
+        return DeterministicReasonMatch("matched", best_index)
+    if best_score >= 0.5:
+        return DeterministicReasonMatch("ambiguous")
+    return DeterministicReasonMatch("unknown")
 
 
 async def match_live_reason(query: str, options: list[str]) -> int | None:
@@ -81,9 +94,9 @@ async def match_live_reason(query: str, options: list[str]) -> int | None:
     semantic selection that never receives or returns ResourcePlus IDs.
     """
 
-    deterministic = _deterministic_match(query, options)
-    if deterministic is not None:
-        return deterministic
+    deterministic = deterministic_reason_match(query, options)
+    if deterministic.index is not None:
+        return deterministic.index
     settings = get_settings()
     if not settings.openai_api_key or not settings.openai_model:
         return None

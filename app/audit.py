@@ -41,6 +41,7 @@ SAFE_ERROR_CATEGORIES = frozenset(
         "websocket_disconnected",
         "resourceplus_error",
         "resourceplus_timeout",
+        "no_resourceplus_suggestion",
         "openai_error",
         "tts_error",
         "validation_error",

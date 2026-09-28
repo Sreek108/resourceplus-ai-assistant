@@ -3,16 +3,14 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
 
-from app.ai.reason_matcher import match_live_reason
+from app.ai.reason_matcher import deterministic_reason_match, match_live_reason
 from app.resourceplus.approvals import (
     approve_all_requests,
     approve_supervisor_request,
     get_pending_approvals,
 )
 from app.resourceplus.attendance import (
-    _parse_iso_datetime,
     create_exceptional_entry,
-    get_attendance_summary,
     get_exception_reasons,
     get_missing_punch_suggestions,
 )
@@ -25,6 +23,12 @@ from app.resourceplus.leave import (
 from app.resourceplus.notifications import (
     get_notifications,
     update_notification_read_status,
+)
+from app.resourceplus.missing_punch import (
+    ENTRY_TYPE_NUMBER,
+    MissingPunchRow,
+    normalize_missing_punch_suggestions,
+    parse_missing_punch_date,
 )
 
 
@@ -45,10 +49,14 @@ class ActionResolutionRequired(Exception):
         *,
         category: str,
         requires_clarification: bool = False,
+        draft_context: dict[str, str] | None = None,
+        reason_options: list[str] | None = None,
     ) -> None:
         super().__init__(message)
         self.category = category
         self.requires_clarification = requires_clarification
+        self.draft_context = draft_context
+        self.reason_options = reason_options
 
 
 def _require_list(value: Any, source: str) -> list[dict[str, Any]]:
@@ -70,14 +78,20 @@ def _parse_resourceplus_date(value: object) -> date:
 
 
 def _parse_suggested_datetime(value: object) -> datetime:
-    if not isinstance(value, str):
+    if not isinstance(value, str) or not re.fullmatch(
+        r"\d{2}/\d{2}/\d{4} \d{2}:\d{2}",
+        value,
+    ):
         raise ValueError("ResourcePlus returned an invalid suggested entry time.")
-    for date_format in ("%d/%m/%Y %H:%M", "%Y-%m-%dT%H:%M:%S"):
-        try:
-            return datetime.strptime(value, date_format)
-        except ValueError:
-            continue
-    raise ValueError("ResourcePlus returned an invalid suggested entry time.")
+    try:
+        parsed = datetime.strptime(value, "%d/%m/%Y %H:%M")
+    except ValueError as exc:
+        raise ValueError(
+            "ResourcePlus returned an invalid suggested entry time."
+        ) from exc
+    if parsed.strftime("%d/%m/%Y %H:%M") != value:
+        raise ValueError("ResourcePlus returned an invalid suggested entry time.")
+    return parsed
 
 
 def _same_text(left: object, right: object) -> bool:
@@ -90,6 +104,28 @@ def _normalized_key(value: object) -> str:
     return "".join(character for character in str(value).casefold() if character.isalnum())
 
 
+def _normalized_words(value: object) -> tuple[str, ...]:
+    if not isinstance(value, str):
+        return ()
+    return tuple(re.findall(r"[^\W_]+", value.casefold(), flags=re.UNICODE))
+
+
+def _reason_was_supplied_in_user_message(reason: str, user_message: object) -> bool:
+    """Require the model's reason text to be grounded in the current user turn."""
+
+    if user_message is None:
+        return False
+    reason_words = _normalized_words(reason)
+    message_words = _normalized_words(user_message)
+    if not reason_words or len(reason_words) > len(message_words):
+        return False
+    width = len(reason_words)
+    return any(
+        message_words[index : index + width] == reason_words
+        for index in range(len(message_words) - width + 1)
+    )
+
+
 def _field(item: dict[str, Any], *names: str) -> object:
     normalized = {_normalized_key(key): value for key, value in item.items()}
     for name in names:
@@ -99,78 +135,85 @@ def _field(item: dict[str, Any], *names: str) -> object:
     return None
 
 
-def _attendance_days(payload: Any) -> list[dict[str, Any]]:
-    if isinstance(payload, list):
-        return _require_list(payload, "attendance summary")
-    if not isinstance(payload, dict):
-        raise ValueError("ResourcePlus returned an unexpected attendance summary response.")
-    days = _field(payload, "Days")
-    return _require_list(days, "attendance days")
-
-
-def _less_hours_seconds(value: object) -> int:
-    if not isinstance(value, str):
-        return 0
-    match = re.fullmatch(r"\s*(\d+):(\d{1,2})(?::(\d{1,2}))?\s*", value)
-    if not match:
-        return 0
-    hours, minutes, seconds = (int(part or 0) for part in match.groups())
-    if minutes >= 60 or seconds >= 60:
-        return 0
-    return hours * 3600 + minutes * 60 + seconds
-
-
-def _less_hours_days(payload: Any) -> dict[date, int]:
-    applicable: dict[date, int] = {}
-    for item in _attendance_days(payload):
-        try:
-            attendance_date = _parse_resourceplus_date(
-                _field(item, "Date", "AttDate", "AttendanceDate", "WorkDate")
-            )
-        except ValueError:
-            continue
-        less_seconds = _less_hours_seconds(
-            _field(item, "LessHrs", "LessHours", "MissingHours")
-        )
-        if less_seconds > 0:
-            applicable[attendance_date] = max(
-                applicable.get(attendance_date, 0),
-                less_seconds,
-            )
-    return applicable
-
-
-def _format_duration(total_seconds: int) -> str:
-    hours, remainder = divmod(total_seconds, 3600)
-    minutes = remainder // 60
-    if hours and minutes:
-        return f"{hours}h {minutes}m"
-    if hours:
-        return f"{hours}h"
-    return f"{minutes}m"
-
-
 def _format_time(value: datetime) -> str:
     hour = value.hour % 12 or 12
     suffix = "AM" if value.hour < 12 else "PM"
     return f"{hour}:{value.minute:02d} {suffix}"
 
 
-def _suggestion_entry_type(value: object) -> int | None:
-    if isinstance(value, bool):
-        return None
-    if value in {1, 2}:
-        return int(value)
-    normalized = str(value).strip().upper()
-    if normalized in {"1", "IN"}:
-        return 1
-    if normalized in {"2", "OUT"}:
-        return 2
-    return None
-
-
 def _format_date(value: date) -> str:
     return value.strftime("%d %B %Y")
+
+
+async def _live_exception_reasons(lang: int) -> list[tuple[str, str]]:
+    reason_rows = _require_list(
+        await get_exception_reasons(lang=lang),
+        "exception reasons",
+    )
+    live_reasons: list[tuple[str, str]] = []
+    for reason in reason_rows:
+        reason_id = _field(reason, "reasonID")
+        reason_name_value = _field(reason, "reasonName")
+        if (
+            not isinstance(reason_id, str)
+            or not reason_id.strip()
+            or not isinstance(reason_name_value, str)
+            or not reason_name_value.strip()
+        ):
+            continue
+        live_reasons.append((reason_id, reason_name_value.strip()))
+    if not live_reasons:
+        raise ValueError("ResourcePlus returned no valid exceptional-entry reasons.")
+    return live_reasons
+
+
+def _reason_required_message(
+    selected: MissingPunchRow,
+    reason_names: list[str],
+    language: str,
+) -> str:
+    choices = "\n".join(f"- {name}" for name in reason_names)
+    suggested = _parse_suggested_datetime(selected.suggested_entry_time)
+    if language == "ar":
+        direction = "الدخول" if selected.entry_type == "IN" else "الخروج"
+        return (
+            f"يقترح ResourcePlus تصحيح بصمة {direction} بتاريخ "
+            f"{selected.att_date.strftime('%d/%m/%Y')} الساعة "
+            f"{suggested.strftime('%H:%M')}.\n\nما سبب التصحيح؟\n\n"
+            f"الأسباب المتاحة:\n{choices}"
+        )
+    return (
+        f"ResourcePlus suggests correcting the missing {selected.entry_type} "
+        f"punch on {_format_date(selected.att_date)} at "
+        f"{_format_time(suggested)}.\n\nWhat was the reason?\n\n"
+        f"Available reasons:\n{choices}"
+    )
+
+
+def _exceptional_entry_intent(
+    selected: MissingPunchRow,
+    *,
+    reason_id: str,
+    reason_name: str,
+    remarks: str,
+    response_language: str,
+) -> ActionIntent:
+    internal = {
+        "entry_time": selected.suggested_entry_time,
+        "entry_type": ENTRY_TYPE_NUMBER[selected.entry_type],
+        "reason_id": reason_id,
+        "reason_name": reason_name,
+        "remarks": remarks,
+        "attendance_date": selected.att_date.isoformat(),
+        "shift": selected.shift,
+        "is_night_shift": selected.is_night_shift,
+    }
+    return ActionIntent(
+        "create_exceptional_entry",
+        internal,
+        _confirmation_summary("create_exceptional_entry", internal, response_language),
+        response_language,
+    )
 
 
 def _parse_notification_datetime(value: object) -> datetime | None:
@@ -216,10 +259,19 @@ def _confirmation_summary(
 ) -> str:
     # This is a safe factual description stored with the immutable action.
     # The conversational layer renders it dynamically in the user's language.
-    del language
     if action_type == "create_exceptional_entry":
         direction = "IN" if values["entry_type"] == 1 else "OUT"
-        entry_time = datetime.fromisoformat(str(values["entry_time"]))
+        entry_time = _parse_suggested_datetime(values["entry_time"])
+        if language == "ar":
+            arabic_direction = "دخول" if direction == "IN" else "خروج"
+            return (
+                "إرسال طلب إدخال استثنائي للبيانات التالية:\n\n"
+                f"التاريخ: {entry_time.strftime('%d/%m/%Y')}\n"
+                f"البصمة: {arabic_direction}\n"
+                f"الوقت المقترح: {entry_time.strftime('%H:%M')}\n"
+                f"السبب: {values['reason_name']}\n\n"
+                "هل ترغب في إرسال الطلب؟ التأكيد مطلوب."
+            )
         return (
             f"ResourcePlus suggests correcting the {direction} punch on "
             f"{_format_date(entry_time.date())} to {_format_time(entry_time)}. "
@@ -267,149 +319,234 @@ async def _prepare_exceptional_entry(
 ) -> ActionIntent:
     target_value = arguments.get("target_date")
     target_date = (
-        _parse_resourceplus_date(target_value)
+        parse_missing_punch_date(target_value)
         if target_value is not None and str(target_value).strip()
         else None
     )
-    reason_name = arguments.get("reason_name")
-    remarks = arguments.get("remarks")
-    if not isinstance(reason_name, str) or not reason_name.strip():
-        raise ActionResolutionRequired(
-            "What reason should I use for the exceptional-entry request?",
-            category="reason_required",
-            requires_clarification=True,
-        )
-    if not isinstance(remarks, str) or not remarks.strip():
-        remarks = reason_name
-
+    requested_direction = arguments.get("punch_direction")
+    if requested_direction is not None and (
+        not isinstance(requested_direction, str)
+        or requested_direction not in ENTRY_TYPE_NUMBER
+    ):
+        raise ValueError("punch_direction must be IN, OUT, or null.")
     if target_date is not None:
         range_start = range_end = target_date
     else:
         raw_start = arguments.get("_range_from")
         raw_end = arguments.get("_range_to")
         if raw_start is not None and raw_end is not None:
-            range_start = _parse_resourceplus_date(raw_start)
-            range_end = _parse_resourceplus_date(raw_end)
+            range_start = parse_missing_punch_date(raw_start)
+            range_end = parse_missing_punch_date(raw_end)
         else:
             range_end = date.today()
             range_start = range_end.replace(day=1)
     if range_start > range_end:
         raise ValueError("The exceptional-entry date range is invalid.")
 
-    attendance = await get_attendance_summary(
-        range_start.isoformat(),
-        range_end.isoformat(),
-        lang=lang,
-    )
-    applicable = _less_hours_days(attendance)
-    if target_date is not None:
-        if target_date not in applicable:
-            raise ActionResolutionRequired(
-                f"I couldn't find an applicable less-hours record for "
-                f"{_format_date(target_date)}, so I can't safely prepare an "
-                "exceptional-entry request for that day.",
-                category="attendance_not_applicable",
-            )
-        selected_date = target_date
-    else:
-        candidates = sorted(applicable.items())
-        if not candidates:
-            raise ActionResolutionRequired(
-                "I couldn't find an applicable less-hours day in that period, so I "
-                "can't safely prepare an exceptional-entry request.",
-                category="no_less_hours_days",
-            )
-        if len(candidates) > 1:
-            choices = "\n".join(
-                f"- {_format_date(day)} — {_format_duration(seconds)}"
-                for day, seconds in candidates
-            )
-            raise ActionResolutionRequired(
-                f"You have {len(candidates)} less-hours days in that period:\n\n"
-                f"{choices}\n\nWhich date would you like to regularize?",
-                category="multiple_less_hours_days",
-                requires_clarification=True,
-            )
-        selected_date = candidates[0][0]
-
-    suggestions = _require_list(
+    normalized = normalize_missing_punch_suggestions(
         await get_missing_punch_suggestions(
-            selected_date.isoformat(),
-            selected_date.isoformat(),
+            range_start.isoformat(),
+            range_end.isoformat(),
             lang=lang,
-        ),
-        "missing-punch suggestions",
+        )
     )
-    matching_suggestions: list[tuple[datetime, int]] = []
-    for suggestion in suggestions:
-        try:
-            suggested_time = _parse_suggested_datetime(
-                _field(suggestion, "suggestedEntryTime")
-            )
-        except ValueError:
-            continue
-        entry_type = _suggestion_entry_type(_field(suggestion, "entryType"))
-        if suggested_time.date() == selected_date and entry_type is not None:
-            matching_suggestions.append((suggested_time, entry_type))
+    parsed_suggestions = [
+        suggestion
+        for suggestion in normalized.correctable_suggestions
+        if range_start <= suggestion.att_date <= range_end
+    ]
+    matching_suggestions = (
+        [
+            suggestion
+            for suggestion in parsed_suggestions
+            if suggestion.att_date == target_date
+        ]
+        if target_date is not None
+        else parsed_suggestions
+    )
+    if requested_direction is not None:
+        matching_suggestions = [
+            suggestion
+            for suggestion in matching_suggestions
+            if suggestion.entry_type == requested_direction
+        ]
     if not matching_suggestions:
+        scope = (
+            f"for {_format_date(target_date)}"
+            if target_date is not None
+            else "in that period"
+        )
+        direction = f" {requested_direction}" if requested_direction else ""
+        message = (
+            f"ResourcePlus does not currently provide a valid{direction} suggested "
+            f"punch correction {scope}."
+        )
         raise ActionResolutionRequired(
-            f"I found the less-hours record for {_format_date(selected_date)}, but "
-            "ResourcePlus doesn't currently provide a suggested punch correction "
-            "for that day, so I can't safely submit an exceptional-entry request for it.",
+            message,
             category="no_resourceplus_suggestion",
         )
+
+    candidate_dates = sorted(
+        {suggestion.att_date for suggestion in matching_suggestions}
+    )
+    if target_date is None and len(candidate_dates) > 1:
+        choices = "\n".join(f"- {_format_date(day)}" for day in candidate_dates)
+        raise ActionResolutionRequired(
+            f"ResourcePlus has missing-punch suggestions for more than one date "
+            f"in that period:\n\n{choices}\n\nWhich date would you like to regularize?",
+            category="multiple_resourceplus_suggestion_dates",
+            requires_clarification=True,
+        )
     if len(matching_suggestions) > 1:
+        candidate_date = matching_suggestions[0].att_date
+        directions = {suggestion.entry_type for suggestion in matching_suggestions}
+        if directions == {"IN", "OUT"}:
+            raise ActionResolutionRequired(
+                f"{_format_date(candidate_date)} has both a missing IN and a missing "
+                "OUT punch. Which one do you want to correct?",
+                category="multiple_resourceplus_suggestions",
+                requires_clarification=True,
+            )
         choices = "\n".join(
-            f"- {'IN' if entry_type == 1 else 'OUT'} at {_format_time(suggested_time)}"
-            for suggested_time, entry_type in matching_suggestions
+            f"- {suggestion.entry_type} at {suggestion.suggested_entry_time}"
+            for suggestion in matching_suggestions
         )
         raise ActionResolutionRequired(
             f"ResourcePlus provides more than one punch correction for "
-            f"{_format_date(selected_date)}:\n\n{choices}\n\nWhich one should I use?",
+            f"{_format_date(candidate_date)}:\n\n"
+            f"{choices}\n\nWhich one should I use?",
             category="multiple_resourceplus_suggestions",
             requires_clarification=True,
         )
 
-    reasons = _require_list(
-        await get_exception_reasons(lang=lang),
-        "exception reasons",
-    )
-    reason_names = [str(_field(reason, "reasonName") or "").strip() for reason in reasons]
+    selected = matching_suggestions[0]
+    live_reasons = await _live_exception_reasons(lang)
+
+    reason_name = arguments.get("reason_name")
+    remarks = arguments.get("remarks")
+    reason_names = [name for _, name in live_reasons]
+    if (
+        not isinstance(reason_name, str)
+        or not reason_name.strip()
+        or not _reason_was_supplied_in_user_message(
+            reason_name,
+            arguments.get("_user_message"),
+        )
+    ):
+        raise ActionResolutionRequired(
+            _reason_required_message(selected, reason_names, response_language),
+            category="reason_required",
+            requires_clarification=True,
+            draft_context={
+                "attendance_date": selected.att_date.isoformat(),
+                "entry_type": selected.entry_type,
+                "suggested_entry_time": str(selected.suggested_entry_time),
+                "language": response_language,
+            },
+            reason_options=reason_names,
+        )
+    if not isinstance(remarks, str) or not remarks.strip():
+        remarks = reason_name
+
     selected_reason_index = await match_live_reason(reason_name, reason_names)
     if selected_reason_index is None:
-        available = [name for name in reason_names if name]
-        choices = ", ".join(available[:6])
-        suffix = f" Available reasons include: {choices}." if choices else ""
+        choices = ", ".join(reason_names[:6])
         raise ActionResolutionRequired(
             "I couldn't confidently match that reason to one ResourcePlus reason."
-            f"{suffix} Which reason should I use?",
+            f" Available reasons include: {choices}. Which reason should I use?",
             category="reason_ambiguous",
             requires_clarification=True,
+            reason_options=reason_names,
         )
-    selected_reason = reasons[selected_reason_index]
-    reason_id = _field(selected_reason, "reasonID")
-    selected_reason_name = reason_names[selected_reason_index]
-    if (
-        reason_id is None
-        or isinstance(reason_id, bool)
-        or not str(reason_id).strip()
-        or not selected_reason_name
-    ):
-        raise ValueError("ResourcePlus returned an invalid exceptional-entry reason.")
+    reason_id, selected_reason_name = live_reasons[selected_reason_index]
 
-    selected_time, selected_entry_type = matching_suggestions[0]
-    internal = {
-        "entry_time": selected_time.isoformat(timespec="seconds"),
-        "entry_type": selected_entry_type,
-        "reason_id": str(reason_id),
-        "reason_name": selected_reason_name,
-        "remarks": remarks.strip(),
-    }
-    return ActionIntent(
-        "create_exceptional_entry",
-        internal,
-        _confirmation_summary("create_exceptional_entry", internal, response_language),
-        response_language,
+    return _exceptional_entry_intent(
+        selected,
+        reason_id=reason_id,
+        reason_name=selected_reason_name,
+        remarks=remarks.strip(),
+        response_language=response_language,
+    )
+
+
+async def prepare_exceptional_entry_reason_follow_up(
+    *,
+    attendance_date: str,
+    entry_type: str,
+    suggested_entry_time: str,
+    reason_text: str,
+    lang: int,
+    response_language: str,
+) -> ActionIntent:
+    """Resolve a draft reason once, using only fresh authoritative live data."""
+
+    target_date = parse_missing_punch_date(attendance_date)
+    if entry_type not in ENTRY_TYPE_NUMBER:
+        raise ValueError("Exceptional-entry draft direction is invalid.")
+    normalized = normalize_missing_punch_suggestions(
+        await get_missing_punch_suggestions(
+            target_date.isoformat(),
+            target_date.isoformat(),
+            lang=lang,
+        )
+    )
+    exact_matches = [
+        suggestion
+        for suggestion in normalized.correctable_suggestions
+        if suggestion.att_date == target_date
+        and suggestion.entry_type == entry_type
+        and suggestion.suggested_entry_time == suggested_entry_time
+    ]
+    if not exact_matches:
+        message = (
+            "تغير اقتراح ResourcePlus لهذه البصمة. ابدأ طلب التصحيح من جديد."
+            if response_language == "ar"
+            else (
+                "The ResourcePlus punch suggestion changed. Please start the "
+                "correction request again."
+            )
+        )
+        raise ActionResolutionRequired(
+            message,
+            category="draft_stale",
+        )
+
+    selected = exact_matches[0]
+    live_reasons = await _live_exception_reasons(lang)
+    reason_names = [name for _, name in live_reasons]
+    match = deterministic_reason_match(reason_text, reason_names)
+    if match.index is None:
+        choices = "\n".join(f"- {name}" for name in reason_names)
+        if response_language == "ar":
+            lead = (
+                "السبب يطابق أكثر من خيار. اختر سببًا واحدًا من القائمة:"
+                if match.status == "ambiguous"
+                else "لم أجد سببًا مطابقًا. اختر سببًا من القائمة:"
+            )
+        else:
+            lead = (
+                "That reason matches more than one option. Please choose one:"
+                if match.status == "ambiguous"
+                else "I couldn't match that reason. Please choose one of these:"
+            )
+        raise ActionResolutionRequired(
+            f"{lead}\n\n{choices}",
+            category=(
+                "reason_ambiguous"
+                if match.status == "ambiguous"
+                else "reason_unknown"
+            ),
+            requires_clarification=True,
+            reason_options=reason_names,
+        )
+
+    reason_id, selected_reason_name = live_reasons[match.index]
+    return _exceptional_entry_intent(
+        selected,
+        reason_id=reason_id,
+        reason_name=selected_reason_name,
+        remarks=reason_text.strip(),
+        response_language=response_language,
     )
 
 

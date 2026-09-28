@@ -714,6 +714,78 @@ describe("ResourcePlus demo UI", () => {
     });
   });
 
+  it("renders live reason chips and submits one exact value only once", async () => {
+    sendChat
+      .mockResolvedValueOnce(
+        response({
+          message: "What was the reason?",
+          needs_reason: true,
+          reason_options: [
+            { label: "Embassy Purposes", value: "Embassy Purposes" },
+            { label: "Family Circumstances", value: "Family Circumstances" },
+          ],
+        }),
+      )
+      .mockResolvedValueOnce(
+        response({
+          message: "Submit this exceptional-entry request?",
+          requires_confirmation: true,
+          confirmation_id: "confirmation-reason",
+        }),
+      );
+    render(<App />);
+    await sendTypedMessage("Correct my September 1 IN punch");
+
+    const group = await screen.findByRole("group", {
+      name: "Select an exceptional-entry reason",
+    });
+    const embassy = screen.getByRole("button", { name: "Embassy Purposes" });
+    expect(group.dir).toBe("ltr");
+    embassy.focus();
+    expect(document.activeElement).toBe(embassy);
+
+    fireEvent.click(embassy);
+    fireEvent.click(embassy);
+
+    await waitFor(() => expect(sendChat).toHaveBeenCalledTimes(2));
+    expect(sendChat).toHaveBeenLastCalledWith({
+      message: "Embassy Purposes",
+      sessionId: "session-new",
+      confirmationId: "",
+    });
+    expect(await screen.findByText(/Selected reason: Embassy Purposes/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Embassy Purposes" })).toBeNull();
+    expect(await screen.findByText("Action requires confirmation")).toBeTruthy();
+    expect(document.body.textContent).not.toContain("reasonID");
+  });
+
+  it("renders Arabic reason options in an RTL accessible group", () => {
+    render(
+      <ChatMessage
+        message={{
+          role: "assistant",
+          text: "ما سبب التصحيح؟",
+          language: "ar",
+          needsReason: true,
+          reasonOptionsActive: true,
+          reasonOptions: [
+            { label: "ظروف عائلية", value: "ظروف عائلية" },
+            { label: "أخرى", value: "أخرى" },
+          ],
+        }}
+        onReasonSelect={vi.fn()}
+        busy={false}
+      />,
+    );
+
+    const group = screen.getByRole("group", {
+      name: "Select an exceptional-entry reason",
+    });
+    expect(group.dir).toBe("rtl");
+    expect(group.lang).toBe("ar");
+    expect(screen.getByRole("button", { name: "ظروف عائلية" })).toBeTruthy();
+  });
+
   it("clears the retained session and messages for a new conversation", async () => {
     sessionStorage.setItem("resourceplus.demo.session", "session-existing");
     sessionStorage.setItem(

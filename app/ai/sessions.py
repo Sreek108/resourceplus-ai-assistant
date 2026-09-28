@@ -24,11 +24,24 @@ class PendingAction:
     expires_at: datetime
 
 
+@dataclass(frozen=True)
+class ExceptionalEntryDraft:
+    """Short-lived selection context that cannot execute a ResourcePlus write."""
+
+    attendance_date: str
+    entry_type: str
+    suggested_entry_time: str
+    language: str
+    created_at: datetime
+    expires_at: datetime
+
+
 @dataclass
 class _SessionState:
     session_id: str
     history: list[HistoryItem] = field(default_factory=list)
     pending_action: PendingAction | None = None
+    exceptional_entry_draft: ExceptionalEntryDraft | None = None
     expired_pending_language: str | None = None
     expired_pending_action_type: str | None = None
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -59,6 +72,26 @@ class SessionStore(Protocol):
         self,
         session_id: str,
     ) -> tuple[PendingAction | None, bool]: ...
+
+    def create_exceptional_entry_draft(
+        self,
+        session_id: str,
+        *,
+        attendance_date: str,
+        entry_type: str,
+        suggested_entry_time: str,
+        language: str,
+    ) -> ExceptionalEntryDraft: ...
+
+    def get_exceptional_entry_draft(
+        self,
+        session_id: str,
+    ) -> ExceptionalEntryDraft | None: ...
+
+    def clear_exceptional_entry_draft(
+        self,
+        session_id: str,
+    ) -> ExceptionalEntryDraft | None: ...
 
     def get_expired_pending_language(self, session_id: str) -> str | None: ...
 
@@ -107,6 +140,17 @@ class InMemorySessionStore:
             expires_at=action.expires_at,
         )
 
+    @staticmethod
+    def _clone_draft(draft: ExceptionalEntryDraft) -> ExceptionalEntryDraft:
+        return ExceptionalEntryDraft(
+            attendance_date=draft.attendance_date,
+            entry_type=draft.entry_type,
+            suggested_entry_time=draft.suggested_entry_time,
+            language=draft.language,
+            created_at=draft.created_at,
+            expires_at=draft.expires_at,
+        )
+
     def _remove_stale_sessions(self, current: datetime) -> None:
         stale = [
             session_id
@@ -152,10 +196,70 @@ class InMemorySessionStore:
             )
             state = self._sessions[session_id]
             state.pending_action = action
+            state.exceptional_entry_draft = None
             state.expired_pending_language = None
             state.expired_pending_action_type = None
             state.updated_at = current
             return self._clone_action(action)
+
+    def create_exceptional_entry_draft(
+        self,
+        session_id: str,
+        *,
+        attendance_date: str,
+        entry_type: str,
+        suggested_entry_time: str,
+        language: str,
+    ) -> ExceptionalEntryDraft:
+        if entry_type not in {"IN", "OUT"}:
+            raise ValueError("Exceptional-entry draft direction must be IN or OUT.")
+        if language not in {"en", "ar"}:
+            raise ValueError("Exceptional-entry draft language must be en or ar.")
+        if not attendance_date or not suggested_entry_time:
+            raise ValueError("Exceptional-entry draft selection is incomplete.")
+        with self._lock:
+            self.ensure_session(session_id)
+            current = self._now()
+            draft = ExceptionalEntryDraft(
+                attendance_date=attendance_date,
+                entry_type=entry_type,
+                suggested_entry_time=suggested_entry_time,
+                language=language,
+                created_at=current,
+                expires_at=current + self.confirmation_ttl,
+            )
+            state = self._sessions[session_id]
+            state.exceptional_entry_draft = draft
+            state.updated_at = current
+            return self._clone_draft(draft)
+
+    def get_exceptional_entry_draft(
+        self,
+        session_id: str,
+    ) -> ExceptionalEntryDraft | None:
+        with self._lock:
+            state = self._sessions.get(session_id)
+            if state is None or state.exceptional_entry_draft is None:
+                return None
+            current = self._now()
+            if current >= state.exceptional_entry_draft.expires_at:
+                state.exceptional_entry_draft = None
+                state.updated_at = current
+                return None
+            return self._clone_draft(state.exceptional_entry_draft)
+
+    def clear_exceptional_entry_draft(
+        self,
+        session_id: str,
+    ) -> ExceptionalEntryDraft | None:
+        with self._lock:
+            state = self._sessions.get(session_id)
+            if state is None or state.exceptional_entry_draft is None:
+                return None
+            draft = self._clone_draft(state.exceptional_entry_draft)
+            state.exceptional_entry_draft = None
+            state.updated_at = self._now()
+            return draft
 
     def get_pending_action(
         self,

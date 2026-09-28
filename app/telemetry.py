@@ -104,6 +104,7 @@ ERROR_OWNER_BY_CATEGORY = {
     "websocket_disconnected": "network",
     "resourceplus_error": "resourceplus_api",
     "resourceplus_timeout": "resourceplus_api",
+    "no_resourceplus_suggestion": "transaction",
     "openai_error": "openai",
     "tts_error": "azure_tts",
     "validation_error": "validation",
@@ -130,6 +131,7 @@ ERROR_STAGE_BY_CATEGORY = {
     "websocket_disconnected": "websocket_request",
     "resourceplus_error": "resourceplus",
     "resourceplus_timeout": "resourceplus",
+    "no_resourceplus_suggestion": "resourceplus",
     "openai_error": "openai_main",
     "tts_error": "tts",
     "validation_error": "validation",
@@ -218,6 +220,34 @@ def _safe_scalar(value: Any, *, limit: int = 128) -> str | int | float | bool | 
     return normalized if SAFE_VALUE_PATTERN.fullmatch(normalized) else None
 
 
+def _safe_diagnostic_text(value: Any, *, limit: int = 240) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = " ".join(value.split())
+    lowered = normalized.casefold()
+    if (
+        not normalized
+        or len(normalized) > limit
+        or "@" in normalized
+        or "http://" in lowered
+        or "https://" in lowered
+        or any(
+            marker in lowered
+            for marker in (
+                "authorization",
+                "bearer",
+                "password",
+                "api_key",
+                "apikey",
+                "secret",
+                "token",
+            )
+        )
+    ):
+        return None
+    return normalized
+
+
 def emit_structured_event(
     *,
     level: str = "INFO",
@@ -230,6 +260,10 @@ def emit_structured_event(
     error_stage: str | None = None,
     retryable: bool | None = None,
     endpoint: str | None = None,
+    upstream_error_code: str | None = None,
+    upstream_error_message: str | None = None,
+    upstream_correlation_id: str | None = None,
+    validation_fields: tuple[str, ...] = (),
 ) -> None:
     """Emit only allowlisted scalar fields; logging failures are swallowed."""
 
@@ -270,6 +304,17 @@ def emit_structured_event(
             "error_stage": error_stage if error_stage in ERROR_STAGES else None,
             "retryable": retryable,
             "endpoint": _safe_scalar(endpoint),
+            "upstream_error_code": _safe_scalar(upstream_error_code),
+            "upstream_error_message": _safe_diagnostic_text(
+                upstream_error_message
+            ),
+            "upstream_correlation_id": _safe_scalar(upstream_correlation_id),
+            "validation_fields": [
+                safe_field
+                for field in validation_fields[:12]
+                if (safe_field := _safe_scalar(field)) is not None
+            ]
+            or None,
         }
         clean = {key: value for key, value in payload.items() if value is not None}
         logger.log(

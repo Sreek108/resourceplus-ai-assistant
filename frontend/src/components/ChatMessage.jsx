@@ -2,12 +2,14 @@ import ReactMarkdown from "react-markdown";
 import { messageDirection, messageLanguage } from "../lib/language";
 import ConfirmationCard from "./ConfirmationCard";
 import { SpeakerIcon } from "./Icons";
+import ReasonOptions from "./ReasonOptions";
 
 export default function ChatMessage({
   message,
   onReplay,
   onConfirm,
   onCancel,
+  onReasonSelect,
   busy,
   debug,
 }) {
@@ -52,6 +54,16 @@ export default function ChatMessage({
             onConfirm={onConfirm}
             onCancel={onCancel}
             disabled={busy}
+          />
+        )}
+        {assistant && message.needsReason && (
+          <ReasonOptions
+            options={message.reasonOptionsActive === false ? [] : message.reasonOptions}
+            onSelect={onReasonSelect}
+            disabled={busy || message.reasonSelectionPending}
+            direction={direction}
+            language={language}
+            selected={message.selectedReason}
           />
         )}
         {assistant && debug && message.debug && (
