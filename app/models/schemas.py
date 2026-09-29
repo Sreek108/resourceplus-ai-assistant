@@ -5,6 +5,8 @@ class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=4_000)
     lang: int | None = Field(default=None, ge=1)
     session_id: str | None = Field(default=None, min_length=1, max_length=128)
+    email: str | None = None
+    instance: str | None = None
     confirmation_id: str | None = Field(default=None, min_length=1, max_length=128)
 
     @field_validator("message")

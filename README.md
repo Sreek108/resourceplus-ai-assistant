@@ -35,9 +35,14 @@ Copy-Item .env.example .env
 ```
 
 Configure `OPENAI_API_KEY`, `OPENAI_MODEL`, and the Azure Speech settings for voice.
-Employee POC calls use `RP_DEFAULT_EMAIL`. Supervisor tools remain disabled until
-`RP_MANAGER_EMAIL` is configured. Production must replace both configured identities
-with authenticated session identities.
+For the demo/UAT integration, the frontend sends the current user's `email` and
+ResourcePlus `instance` as one identity pair on every text or voice request. The
+backend binds that pair to the request and uses it for employee and supervisor
+ResourcePlus calls. `RP_DEFAULT_EMAIL` and `RP_INSTANCE` are retained only as a
+paired local-development/test fallback when neither request field is present.
+UAT and production reject requests that omit the pair and never use those defaults.
+Production must replace the frontend-supplied pair with validated ResourcePlus
+authentication/session identity.
 
 The default CORS setting permits only the local Vite origins
 `http://127.0.0.1:5173` and `http://localhost:5173`. Override
@@ -186,7 +191,11 @@ Initial message:
 
 ```json
 {
-  "message": "I need annual leave from 2026-09-22 to 2026-09-24"
+  "message": "I need annual leave from 2026-09-22 to 2026-09-24",
+  "session_id": "session-123",
+  "email": "employee@company.com",
+  "instance": "Universal",
+  "confirmation_id": null
 }
 ```
 
@@ -197,13 +206,18 @@ same chat endpoint:
 {
   "message": "Yes",
   "session_id": "backend-issued-session-id",
+  "email": "employee@company.com",
+  "instance": "Universal",
   "confirmation_id": "backend-issued-confirmation-id"
 }
 ```
 
 The confirmation ID is optional only when a session has exactly one current pending
 action, but clients should always return it. A `Yes` without a pending action never
-executes anything.
+executes anything. `email` and `instance` must be supplied together. Conversation
+state and pending confirmations are owned by the combined
+`email + instance + session_id`; reusing a session or confirmation under a different
+identity is rejected without a ResourcePlus write.
 
 The complete HTTP fallback and WebSocket frontend contract is documented in
 [Voice Chat API](docs/VOICE_CHAT_API.md).
@@ -212,12 +226,14 @@ Voice fallback requests use `multipart/form-data` at `POST /api/voice/chat` with
 
 - `audio`: PCM WAV file (required)
 - `session_id`: current session when present
+- `email`: current demo/UAT user's email
+- `instance`: current demo/UAT ResourcePlus instance
 - `confirmation_id`: current pending confirmation when present
 
 Streaming voice uses `WS /api/voice/stream`. In summary:
 
-1. Client sends `{"type":"start","sample_rate":16000}` with optional session and
-   confirmation references.
+1. Client sends a `start` object with `sample_rate: 16000`, the `email` + `instance`
+   identity pair, and optional session, confirmation, trace, and debug fields.
 2. Server replies `{"type":"ready"}`.
 3. Client sends raw mono PCM as binary frames while the microphone is held.
 4. Client sends `{"type":"end"}` on release or `{"type":"cancel"}` on cancellation.

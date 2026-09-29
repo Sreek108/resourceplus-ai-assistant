@@ -34,6 +34,20 @@ export class ClientRequestError extends Error {
   }
 }
 
+function demoIdentityFields(email, instance) {
+  const normalizedEmail = typeof email === "string" ? email.trim() : "";
+  const normalizedInstance = typeof instance === "string" ? instance.trim() : "";
+  if (Boolean(normalizedEmail) !== Boolean(normalizedInstance)) {
+    throw new ClientRequestError(
+      "The current demo user identity is incomplete.",
+      "invalid_identity",
+    );
+  }
+  return normalizedEmail
+    ? { email: normalizedEmail, instance: normalizedInstance }
+    : {};
+}
+
 async function parseResponse(response, requestType) {
   let payload = null;
   try {
@@ -131,14 +145,16 @@ function friendlyStatusMessage(status, requestType, serverCode) {
   return { code: "request_failed", message: "Something went wrong. Please try again." };
 }
 
-export async function sendChat({ message, sessionId, confirmationId }) {
+export async function sendChat({ message, sessionId, confirmationId, email, instance }) {
   try {
+    const identity = demoIdentityFields(email, instance);
     const response = await fetch(`${API_BASE_URL}/api/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         message,
         ...(sessionId ? { session_id: sessionId } : {}),
+        ...identity,
         ...(confirmationId ? { confirmation_id: confirmationId } : {}),
       }),
     });
@@ -154,10 +170,15 @@ export async function sendChat({ message, sessionId, confirmationId }) {
   }
 }
 
-export async function sendVoice({ audio, sessionId, confirmationId }) {
+export async function sendVoice({ audio, sessionId, confirmationId, email, instance }) {
   const form = new FormData();
   form.append("audio", audio, "resourceplus-voice.wav");
   if (sessionId) form.append("session_id", sessionId);
+  const identity = demoIdentityFields(email, instance);
+  if (identity.email) {
+    form.append("email", identity.email);
+    form.append("instance", identity.instance);
+  }
   if (confirmationId) form.append("confirmation_id", confirmationId);
   try {
     const response = await fetch(`${API_BASE_URL}/api/voice/chat`, {
@@ -176,7 +197,19 @@ export async function sendVoice({ audio, sessionId, confirmationId }) {
   }
 }
 
-export function openVoiceStream({ sessionId, confirmationId, debug = false }) {
+export function openVoiceStream({
+  sessionId,
+  confirmationId,
+  email,
+  instance,
+  debug = false,
+}) {
+  let identity;
+  try {
+    identity = demoIdentityFields(email, instance);
+  } catch (error) {
+    return Promise.reject(error);
+  }
   if (!globalThis.WebSocket) {
     return Promise.reject(
       new ClientRequestError("Streaming voice is unavailable.", "stream_unavailable"),
@@ -226,6 +259,7 @@ export function openVoiceStream({ sessionId, confirmationId, debug = false }) {
         type: "start",
         sample_rate: 16_000,
         ...(sessionId ? { session_id: sessionId } : {}),
+        ...identity,
         ...(confirmationId ? { confirmation_id: confirmationId } : {}),
         ...(debug ? { debug: true } : {}),
       }));

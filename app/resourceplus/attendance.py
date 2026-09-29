@@ -2,7 +2,8 @@ import re
 from datetime import date, datetime
 from typing import Any
 
-from app.config import DEFAULT_RESOURCEPLUS_LANG, get_settings
+from app.config import DEFAULT_RESOURCEPLUS_LANG
+from app.identity import resourceplus_identity
 from app.resourceplus.client import ResourcePlusClient
 
 
@@ -26,6 +27,7 @@ async def get_attendance_summary(
     to_date: date | str,
     lang: int = DEFAULT_RESOURCEPLUS_LANG,
     usr_email: str | None = None,
+    instance_name: str | None = None,
     *,
     client: ResourcePlusClient | None = None,
 ) -> Any:
@@ -34,17 +36,15 @@ async def get_attendance_summary(
     if start > end:
         raise ValueError("from_date must be on or before to_date.")
 
-    settings = get_settings()
-    # TODO: Replace the configured POC email with authenticated_user.email.
-    identity = usr_email or settings.rp_default_email
+    identity = resourceplus_identity(email=usr_email, instance=instance_name)
     resourceplus = client or ResourcePlusClient()
     return await resourceplus.get(
         ATTENDANCE_SUMMARY_ROUTE,
         params={
-            "usrEmail": identity,
+            "usrEmail": identity.email,
             "fromDate": start.isoformat(),
             "toDate": end.isoformat(),
-            "instanceName": settings.rp_instance,
+            "instanceName": identity.instance,
             "lang": lang,
         },
     )
@@ -55,6 +55,7 @@ async def get_missing_punch_suggestions(
     to_date: date | str,
     lang: int = DEFAULT_RESOURCEPLUS_LANG,
     usr_email: str | None = None,
+    instance_name: str | None = None,
     *,
     client: ResourcePlusClient | None = None,
 ) -> Any:
@@ -63,16 +64,15 @@ async def get_missing_punch_suggestions(
     if start > end:
         raise ValueError("from_date must be on or before to_date.")
 
-    settings = get_settings()
-    identity = usr_email or settings.rp_default_email
+    identity = resourceplus_identity(email=usr_email, instance=instance_name)
     resourceplus = client or ResourcePlusClient()
     return await resourceplus.get(
         MISSING_PUNCH_SUGGESTIONS_ROUTE,
         params={
-            "usrEmail": identity,
+            "usrEmail": identity.email,
             "fromDate": start.isoformat(),
             "toDate": end.isoformat(),
-            "instanceName": settings.rp_instance,
+            "instanceName": identity.instance,
             "lang": lang,
         },
     )
@@ -83,12 +83,12 @@ async def get_exception_reasons(
     *,
     client: ResourcePlusClient | None = None,
 ) -> Any:
-    settings = get_settings()
+    identity = resourceplus_identity()
     resourceplus = client or ResourcePlusClient()
     return await resourceplus.get(
         EXCEPTION_REASONS_ROUTE,
         params={
-            "instanceName": settings.rp_instance,
+            "instanceName": identity.instance,
             "lang": lang,
         },
     )
@@ -116,6 +116,7 @@ async def create_exceptional_entry(
     reason_id: str,
     remarks: str,
     usr_email: str | None = None,
+    instance_name: str | None = None,
     *,
     client: ResourcePlusClient | None = None,
 ) -> Any:
@@ -127,14 +128,13 @@ async def create_exceptional_entry(
     if not remarks.strip():
         raise ValueError("remarks are required.")
 
-    settings = get_settings()
-    identity = usr_email or settings.rp_default_email
+    identity = resourceplus_identity(email=usr_email, instance=instance_name)
     resourceplus = client or ResourcePlusClient()
     return await resourceplus.post(
         CREATE_EXCEPTIONAL_ENTRY_ROUTE,
-        params={"instanceName": settings.rp_instance},
+        params={"instanceName": identity.instance},
         json_body={
-            "usrEmail": identity,
+            "usrEmail": identity.email,
             "entryTime": submit_entry_time,
             "entryType": entry_type,
             "reasonID": reason_id,

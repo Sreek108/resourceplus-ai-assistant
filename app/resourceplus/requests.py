@@ -3,7 +3,8 @@ import logging
 from datetime import date
 from typing import Any, Awaitable
 
-from app.config import DEFAULT_RESOURCEPLUS_LANG, get_settings
+from app.config import DEFAULT_RESOURCEPLUS_LANG
+from app.identity import resourceplus_identity
 from app.resourceplus.attendance import _parse_iso_date
 from app.resourceplus.client import (
     ResourcePlusClient,
@@ -52,6 +53,7 @@ async def get_exceptional_entry_requests(
     to_date: date | str,
     lang: int = DEFAULT_RESOURCEPLUS_LANG,
     usr_email: str | None = None,
+    instance_name: str | None = None,
     *,
     client: ResourcePlusClient | None = None,
 ) -> Any:
@@ -60,16 +62,15 @@ async def get_exceptional_entry_requests(
     if start > end:
         raise ValueError("from_date must be on or before to_date.")
 
-    settings = get_settings()
-    identity = usr_email or settings.rp_default_email
+    identity = resourceplus_identity(email=usr_email, instance=instance_name)
     resourceplus = client or ResourcePlusClient()
     return await resourceplus.get(
         EXCEPTIONAL_ENTRY_REQUESTS_ROUTE,
         params={
-            "usrEmail": identity,
+            "usrEmail": identity.email,
             "fromDate": start.strftime("%m/%d/%Y"),
             "toDate": end.strftime("%m/%d/%Y"),
-            "instanceName": settings.rp_instance,
+            "instanceName": identity.instance,
             "lang": lang,
         },
     )

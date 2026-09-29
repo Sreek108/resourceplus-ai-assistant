@@ -16,11 +16,18 @@ from app.ai.agent import (
 from app.ai.sessions import (
     PendingActionExpired,
     PendingActionMismatch,
+    SessionIdentityMismatch,
     SessionStore,
     session_store,
 )
 from app.audit import record_action_state, record_safe_error, record_tool_usage
 from app.config import get_settings
+from app.identity import (
+    RequestIdentityError,
+    bind_request_identity,
+    reset_request_identity,
+    resolve_request_identity,
+)
 from app.models.schemas import ChatRequest, ChatResponse
 from app.resourceplus import ResourcePlusError
 from app.speech.language import count_script_letters
@@ -297,7 +304,58 @@ async def process_chat(
     detected_language: str | None = None,
     store: SessionStore = session_store,
 ) -> ChatResponse:
-    """Run one chat turn for either the text or voice API."""
+    """Bind one validated identity to a text or voice chat turn."""
+
+    language = detected_language or detect_language(request.message)
+    try:
+        identity = resolve_request_identity(request.email, request.instance)
+    except RequestIdentityError:
+        message = (
+            "يجب إرسال البريد الإلكتروني والجهة معًا لهذا الطلب."
+            if language == "ar"
+            else "The demo user email and ResourcePlus instance must be sent together."
+        )
+        return ChatResponse(
+            success=False,
+            message=message,
+            language=language,
+            session_id=request.session_id or "identity-required",
+        ).set_speech_message(message)
+
+    identity_token = bind_request_identity(identity)
+    try:
+        return await _process_chat(
+            request,
+            detected_language=detected_language,
+            store=store,
+        )
+    except SessionIdentityMismatch:
+        record_safe_error("access_denied")
+        message = (
+            "لا يمكن استخدام هذه المحادثة مع المستخدم الحالي. ابدأ محادثة جديدة."
+            if language == "ar"
+            else (
+                "This conversation cannot be used with the current signed-in user. "
+                "Start a new conversation."
+            )
+        )
+        return ChatResponse(
+            success=False,
+            message=message,
+            language=language,
+            session_id=request.session_id or "identity-mismatch",
+        ).set_speech_message(message)
+    finally:
+        reset_request_identity(identity_token)
+
+
+async def _process_chat(
+    request: ChatRequest,
+    *,
+    detected_language: str | None = None,
+    store: SessionStore = session_store,
+) -> ChatResponse:
+    """Run a chat turn inside an already-bound request identity."""
 
     lang = request.lang or get_settings().rp_default_lang
     session_id = store.ensure_session(request.session_id)

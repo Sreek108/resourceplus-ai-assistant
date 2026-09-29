@@ -4,6 +4,7 @@ import {
   buildVoiceStreamUrl,
   openVoiceStream,
   resolveApiBaseUrl,
+  sendChat,
   sendVoice,
 } from "./api";
 
@@ -106,6 +107,8 @@ describe("streaming voice protocol", () => {
     const stream = await openVoiceStream({
       sessionId: "session-1",
       confirmationId: "confirmation-1",
+      email: "employee@example.com",
+      instance: "Universal",
       debug: true,
     });
     const pcm = new ArrayBuffer(640);
@@ -118,6 +121,8 @@ describe("streaming voice protocol", () => {
       type: "start",
       sample_rate: 16000,
       session_id: "session-1",
+      email: "employee@example.com",
+      instance: "Universal",
       confirmation_id: "confirmation-1",
       debug: true,
     });
@@ -153,6 +158,53 @@ describe("streaming voice protocol", () => {
     FakeWebSocket.instance.onclose();
 
     await expect(result).rejects.toMatchObject({ code: "stream_disconnected" });
+  });
+});
+
+describe("demo identity transport", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("sends the complete identity pair for text and voice HTTP", async () => {
+    const requests = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (url, options) => {
+      requests.push({ url, options });
+      return new Response(JSON.stringify({ success: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+
+    await sendChat({
+      message: "Show my profile",
+      sessionId: "session-1",
+      email: "employee@example.com",
+      instance: "Universal",
+    });
+    await sendVoice({
+      audio: new Blob(["wav"]),
+      sessionId: "session-1",
+      email: "employee@example.com",
+      instance: "Universal",
+    });
+
+    expect(JSON.parse(requests[0].options.body)).toMatchObject({
+      email: "employee@example.com",
+      instance: "Universal",
+    });
+    expect(requests[1].options.body.get("email")).toBe("employee@example.com");
+    expect(requests[1].options.body.get("instance")).toBe("Universal");
+  });
+
+  it.each([
+    [{ email: "employee@example.com" }],
+    [{ instance: "Universal" }],
+  ])("rejects a partial identity before sending", async (identity) => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    await expect(sendChat({ message: "Hello", ...identity })).rejects.toMatchObject({
+      code: "invalid_identity",
+    });
+    expect(fetchSpy).not.toHaveBeenCalled();
   });
 });
 

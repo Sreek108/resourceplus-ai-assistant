@@ -1,6 +1,7 @@
 from typing import Any
 
-from app.config import DEFAULT_RESOURCEPLUS_LANG, get_settings
+from app.config import DEFAULT_RESOURCEPLUS_LANG
+from app.identity import resourceplus_identity
 from app.resourceplus.client import ResourcePlusClient
 
 
@@ -11,17 +12,17 @@ UPDATE_NOTIFICATION_READ_STATUS_ROUTE = "api/Client/UpdateReadStatus"
 async def get_notifications(
     lang: int = DEFAULT_RESOURCEPLUS_LANG,
     usr_email: str | None = None,
+    instance_name: str | None = None,
     *,
     client: ResourcePlusClient | None = None,
 ) -> Any:
-    settings = get_settings()
-    identity = usr_email or settings.rp_default_email
+    identity = resourceplus_identity(email=usr_email, instance=instance_name)
     resourceplus = client or ResourcePlusClient()
     response = await resourceplus.get(
         NOTIFICATIONS_ROUTE,
         params={
-            "instanceName": settings.rp_instance,
-            "usrEmail": identity,
+            "instanceName": identity.instance,
+            "usrEmail": identity.email,
             "lang": lang,
         },
     )
@@ -35,6 +36,7 @@ async def update_notification_read_status(
     read_status: int,
     lang: int = DEFAULT_RESOURCEPLUS_LANG,
     usr_email: str | None = None,
+    instance_name: str | None = None,
     *,
     client: ResourcePlusClient | None = None,
 ) -> Any:
@@ -47,14 +49,13 @@ async def update_notification_read_status(
     if read_status not in {0, 1}:
         raise ValueError("read_status must be 0 (unread) or 1 (read).")
 
-    settings = get_settings()
-    identity = usr_email or settings.rp_default_email
+    identity = resourceplus_identity(email=usr_email, instance=instance_name)
     resourceplus = client or ResourcePlusClient()
     return await resourceplus.get(
         UPDATE_NOTIFICATION_READ_STATUS_ROUTE,
         params={
-            "instanceName": settings.rp_instance,
-            "usrEmail": identity,
+            "instanceName": identity.instance,
+            "usrEmail": identity.email,
             "lang": lang,
             "notifcnID": notifcn_id,
             "readStatus": read_status,

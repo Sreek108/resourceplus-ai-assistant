@@ -38,8 +38,16 @@ Multipart fields:
 - `audio` is required. It must be a WAV upload sent as `audio/wav`, `audio/x-wav`,
   or `application/octet-stream`.
 - `session_id` is optional. Reuse it across text and voice turns.
+- `email` is the current demo/UAT user's email.
+- `instance` is the current demo/UAT ResourcePlus instance.
 - `confirmation_id` is optional. Send the backend-issued pending confirmation ID
   when one exists.
+
+`email` and `instance` are one identity pair: send both or neither. When neither is
+sent, the backend may use the complete `RP_DEFAULT_EMAIL` + `RP_INSTANCE` pair as a
+local-development/test fallback. UAT and production require the request pair and
+never use those defaults. The backend never combines one request field with one
+default field.
 
 The upload limit is 10 MiB. The client does not send transcript text or choose a
 language. The response is JSON.
@@ -112,6 +120,8 @@ The first WebSocket frame must be a text frame containing a JSON object:
   "type": "start",
   "sample_rate": 16000,
   "session_id": "session-value",
+  "email": "employee@company.com",
+  "instance": "Universal",
   "confirmation_id": null,
   "trace_id": "voice-demo-001",
   "debug": false
@@ -124,6 +134,8 @@ Fields:
 - `sample_rate` is required and must be exactly `16000`.
 - `session_id` is optional. When supplied, it is a string from 1 to 128
   characters.
+- `email` and `instance` identify the current demo/UAT ResourcePlus user and tenant.
+  They must be supplied together. Neither value is chosen by the AI model.
 - `confirmation_id` is optional. When supplied, it is a string from 1 to 128
   characters.
 - `trace_id` is optional. It is trimmed, must be 8 to 64 ASCII characters, must
@@ -285,6 +297,8 @@ CONNECT wss://app.resourceplus.app/ai-assistant/api/voice/stream
      "type": "start",
      "sample_rate": 16000,
      "session_id": "session-value",
+     "email": "employee@company.com",
+     "instance": "Universal",
      "confirmation_id": null,
      "trace_id": "voice-demo-001",
      "debug": false
@@ -331,11 +345,21 @@ Server closes with WebSocket code 1000.
 Use the returned `session_id` on later calls. The same ID may move among
 `/api/chat`, `/api/voice/chat`, and `/api/voice/stream`.
 
+Conversation ownership is the combined `email + instance + session_id`. If the same
+session ID is presented with a different email or instance, the backend rejects that
+turn and does not reuse the existing history. Pending actions carry the identity that
+created them and can be confirmed only by the same identity in the same session; an
+identity mismatch performs no ResourcePlus write.
+
 Write requests create the same immutable `PendingAction` used by text chat. Voice
 responses return `requires_confirmation=true` and a `confirmation_id`. A later
 natural affirmative or negative utterance is interpreted conversationally; it is
 not limited to a hardcoded Arabic phrase list. A confirmed write executes only the
 already-stored arguments.
+
+The frontend-supplied `email` + `instance` pair is demo/UAT identity transport only.
+It is not production authentication. Production must replace it with identity derived
+from a validated ResourcePlus authentication/session mechanism.
 
 ## Configuration
 
@@ -355,7 +379,9 @@ The Arabic voice may instead be set to `ar-SA-HamedNeural`.
 ```powershell
 curl.exe -X POST "http://127.0.0.1:8000/api/voice/chat" `
   -F "audio=@C:\path\to\utterance.wav;type=audio/wav" `
-  -F "session_id=demo-session"
+  -F "session_id=demo-session" `
+  -F "email=employee@company.com" `
+  -F "instance=Universal"
 ```
 
 Do not send a confirmation during a live demo unless the displayed pending action

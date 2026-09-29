@@ -36,6 +36,7 @@ async def test_attendance_uses_expected_route_and_parameter_casing() -> None:
         "2026-09-14",
         "2026-09-19",
         usr_email="employee@example.com",
+        instance_name="Universal",
         client=client,
     )
     assert result == {"Attendance Counts": []}
@@ -65,7 +66,11 @@ async def test_client_routes_preserve_documented_parameter_casing(
         base_url="https://example.test/Mobile/",
         transport=httpx.MockTransport(handler),
     )
-    result = await getter(usr_email="employee@example.com", client=client)
+    result = await getter(
+        usr_email="employee@example.com",
+        instance_name="Universal",
+        client=client,
+    )
     assert result == {"ok": True}
 
 

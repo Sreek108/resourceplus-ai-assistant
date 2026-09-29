@@ -8,6 +8,7 @@ from typing import Callable, Protocol
 from uuid import uuid4
 
 from app.config import get_settings
+from app.identity import RequestIdentity, current_request_identity
 
 
 HistoryItem = dict[str, str]
@@ -22,6 +23,7 @@ class PendingAction:
     language: str
     created_at: datetime
     expires_at: datetime
+    owner: RequestIdentity = field(repr=False)
 
 
 @dataclass(frozen=True)
@@ -39,6 +41,7 @@ class ExceptionalEntryDraft:
 @dataclass
 class _SessionState:
     session_id: str
+    owner: RequestIdentity = field(repr=False)
     history: list[HistoryItem] = field(default_factory=list)
     pending_action: PendingAction | None = None
     exceptional_entry_draft: ExceptionalEntryDraft | None = None
@@ -52,6 +55,10 @@ class PendingActionExpired(Exception):
 
 
 class PendingActionMismatch(Exception):
+    pass
+
+
+class SessionIdentityMismatch(Exception):
     pass
 
 
@@ -138,6 +145,7 @@ class InMemorySessionStore:
             language=action.language,
             created_at=action.created_at,
             expires_at=action.expires_at,
+            owner=action.owner,
         )
 
     @staticmethod
@@ -160,15 +168,32 @@ class InMemorySessionStore:
         for session_id in stale:
             self._sessions.pop(session_id, None)
 
+    def _owned_state(self, session_id: str) -> _SessionState | None:
+        state = self._sessions.get(session_id)
+        if state is not None and state.owner != current_request_identity():
+            raise SessionIdentityMismatch(
+                "The conversation does not belong to the current demo identity."
+            )
+        return state
+
     def ensure_session(self, session_id: str | None = None) -> str:
         with self._lock:
             current = self._now()
             self._remove_stale_sessions(current)
             resolved = session_id or str(uuid4())
+            identity = current_request_identity()
             state = self._sessions.get(resolved)
             if state is None:
-                state = _SessionState(session_id=resolved, updated_at=current)
+                state = _SessionState(
+                    session_id=resolved,
+                    owner=identity,
+                    updated_at=current,
+                )
                 self._sessions[resolved] = state
+            elif state.owner != identity:
+                raise SessionIdentityMismatch(
+                    "The conversation does not belong to the current demo identity."
+                )
             else:
                 state.updated_at = current
             return resolved
@@ -193,6 +218,7 @@ class InMemorySessionStore:
                 language=language,
                 created_at=current,
                 expires_at=current + self.confirmation_ttl,
+                owner=current_request_identity(),
             )
             state = self._sessions[session_id]
             state.pending_action = action
@@ -238,7 +264,7 @@ class InMemorySessionStore:
         session_id: str,
     ) -> ExceptionalEntryDraft | None:
         with self._lock:
-            state = self._sessions.get(session_id)
+            state = self._owned_state(session_id)
             if state is None or state.exceptional_entry_draft is None:
                 return None
             current = self._now()
@@ -253,7 +279,7 @@ class InMemorySessionStore:
         session_id: str,
     ) -> ExceptionalEntryDraft | None:
         with self._lock:
-            state = self._sessions.get(session_id)
+            state = self._owned_state(session_id)
             if state is None or state.exceptional_entry_draft is None:
                 return None
             draft = self._clone_draft(state.exceptional_entry_draft)
@@ -268,7 +294,7 @@ class InMemorySessionStore:
         """Return (action, expired). Expired actions are discarded immediately."""
 
         with self._lock:
-            state = self._sessions.get(session_id)
+            state = self._owned_state(session_id)
             if state is None or state.pending_action is None:
                 return None, False
             current = self._now()
@@ -282,12 +308,12 @@ class InMemorySessionStore:
 
     def get_expired_pending_language(self, session_id: str) -> str | None:
         with self._lock:
-            state = self._sessions.get(session_id)
+            state = self._owned_state(session_id)
             return state.expired_pending_language if state else None
 
     def get_expired_pending_action_type(self, session_id: str) -> str | None:
         with self._lock:
-            state = self._sessions.get(session_id)
+            state = self._owned_state(session_id)
             return state.expired_pending_action_type if state else None
 
     def consume_pending_action(
@@ -296,11 +322,15 @@ class InMemorySessionStore:
         confirmation_id: str | None = None,
     ) -> PendingAction:
         with self._lock:
-            state = self._sessions.get(session_id)
+            state = self._owned_state(session_id)
             if state is None or state.pending_action is None:
                 raise PendingActionMismatch("There is no pending action to confirm.")
             current = self._now()
             action = state.pending_action
+            if action.owner != current_request_identity():
+                raise PendingActionMismatch(
+                    "The pending action does not belong to the current demo identity."
+                )
             if current >= action.expires_at:
                 state.pending_action = None
                 state.updated_at = current
@@ -315,7 +345,7 @@ class InMemorySessionStore:
 
     def discard_pending_action(self, session_id: str) -> PendingAction | None:
         with self._lock:
-            state = self._sessions.get(session_id)
+            state = self._owned_state(session_id)
             if state is None or state.pending_action is None:
                 return None
             action = self._clone_action(state.pending_action)
@@ -327,7 +357,7 @@ class InMemorySessionStore:
 
     def get_history(self, session_id: str) -> list[HistoryItem]:
         with self._lock:
-            state = self._sessions.get(session_id)
+            state = self._owned_state(session_id)
             return deepcopy(state.history) if state else []
 
     def append_history(self, session_id: str, role: str, content: str) -> None:

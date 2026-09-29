@@ -114,8 +114,9 @@ Marking notifications read requires explicit confirmation.
 
 ## Manager
 
-Manager demonstrations require `RP_MANAGER_EMAIL`. Employee identity must never be
-silently reused as the manager identity.
+For manager demonstrations, sign in as the manager so the frontend sends that
+manager's `email` + `instance` pair. Supervisor tools use this request-scoped
+identity; they do not substitute an employee or configured manager identity.
 
 ### Pending approvals
 

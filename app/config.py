@@ -25,7 +25,6 @@ class Settings(BaseSettings):
     rp_default_email: str = "saneesh.netsoftpro@gmail.com"
     rp_default_lang: int = Field(default=DEFAULT_RESOURCEPLUS_LANG, ge=1)
     rp_timeout_seconds: float = Field(default=20.0, gt=0)
-    rp_manager_email: str | None = None
     confirmation_ttl_seconds: int = Field(default=300, ge=30, le=1_800)
     session_ttl_seconds: int = Field(default=1_800, ge=300, le=86_400)
     cors_allowed_origins: str = "http://127.0.0.1:5173,http://localhost:5173"
@@ -60,7 +59,6 @@ class Settings(BaseSettings):
     @field_validator(
         "openai_api_key",
         "openai_model",
-        "rp_manager_email",
         "azure_speech_key",
         "azure_speech_region",
         "observability_endpoint",

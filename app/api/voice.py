@@ -12,6 +12,7 @@ from app.audit import (
     start_interaction_audit,
 )
 from app.config import get_settings
+from app.identity import RequestIdentityError, resolve_request_identity
 from app.models.schemas import ChatRequest, VoiceChatResponse
 from app.observability import (
     SAFE_VOICE_ERROR_CATEGORIES,
@@ -124,7 +125,16 @@ async def voice_chat(
     audio: UploadFile = File(...),
     session_id: str | None = Form(default=None),
     confirmation_id: str | None = Form(default=None),
+    email: str | None = Form(default=None),
+    instance: str | None = Form(default=None),
 ) -> VoiceChatResponse:
+    try:
+        request_identity = resolve_request_identity(email, instance)
+    except RequestIdentityError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "invalid_identity", "message": str(exc)},
+        ) from exc
     audit, audit_token = start_interaction_audit(
         input_mode="voice",
         input_source="stt",
@@ -152,6 +162,8 @@ async def voice_chat(
                 ChatRequest(
                     message=recognized.transcript,
                     session_id=session_id,
+                    email=request_identity.email,
+                    instance=request_identity.instance,
                     confirmation_id=confirmation_id,
                 ),
                 detected_language=recognized.detected_language,
@@ -361,6 +373,16 @@ async def voice_stream(websocket: WebSocket) -> None:
                 "The confirmation reference is invalid.",
                 safe_category="invalid_stream_state",
             )
+        try:
+            request_identity = resolve_request_identity(
+                metadata.get("email"),
+                metadata.get("instance"),
+            )
+        except RequestIdentityError as exc:
+            raise SpeechInputError(
+                "The demo identity must contain a valid email and instance pair.",
+                safe_category="invalid_stream_state",
+            ) from exc
         debug = metadata.get("debug") is True
         audit, audit_token = start_interaction_audit(
             input_mode="voice",
@@ -434,6 +456,8 @@ async def voice_stream(websocket: WebSocket) -> None:
                 ChatRequest(
                     message=recognized.transcript,
                     session_id=session_id,
+                    email=request_identity.email,
+                    instance=request_identity.instance,
                     confirmation_id=confirmation_id,
                 ),
                 detected_language=recognized.detected_language,

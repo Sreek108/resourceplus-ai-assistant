@@ -12,6 +12,11 @@ import { isValidWavBlob, startWavRecording } from "./lib/wavRecorder";
 const SESSION_KEY = "resourceplus.demo.session";
 const CONFIRMATION_KEY = "resourceplus.demo.confirmation";
 const MESSAGES_KEY = "resourceplus.demo.messages";
+const DEMO_EMAIL = (import.meta.env.VITE_RP_EMAIL || "").trim();
+const DEMO_INSTANCE = (import.meta.env.VITE_RP_INSTANCE || "").trim();
+const DEMO_IDENTITY = DEMO_EMAIL || DEMO_INSTANCE
+  ? { email: DEMO_EMAIL, instance: DEMO_INSTANCE }
+  : {};
 const MIN_RECORDING_MS = 600;
 const MIN_WAV_BYTES = 1_000;
 const NO_SPEECH_CODES = new Set(["no_speech", "no_audio", "no_recognized_speech"]);
@@ -228,6 +233,7 @@ export default function App() {
       const response = await sendChat({
         message: text,
         sessionId,
+        ...DEMO_IDENTITY,
         confirmationId: confirmationOverride ?? confirmationId,
       });
       applySession(response);
@@ -297,6 +303,7 @@ export default function App() {
       voiceStreamErrorRef.current = null;
       voiceStreamPromiseRef.current = openVoiceStream({
         sessionId,
+        ...DEMO_IDENTITY,
         confirmationId,
         debug,
       })
@@ -390,14 +397,24 @@ export default function App() {
             return;
           }
           if (confirmationId) throw streamError;
-          response = await sendVoice({ audio, sessionId, confirmationId });
+          response = await sendVoice({
+            audio,
+            sessionId,
+            ...DEMO_IDENTITY,
+            confirmationId,
+          });
         }
       } else {
         const streamError = voiceStreamErrorRef.current;
         if (confirmationId) {
           throw streamError || new Error("The streaming voice connection was interrupted.");
         }
-        response = await sendVoice({ audio, sessionId, confirmationId });
+        response = await sendVoice({
+          audio,
+          sessionId,
+          ...DEMO_IDENTITY,
+          confirmationId,
+        });
       }
       applySession(response);
 

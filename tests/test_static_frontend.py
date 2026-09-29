@@ -79,7 +79,6 @@ def test_production_javascript_contains_no_configured_secrets() -> None:
         settings.openai_api_key,
         settings.azure_speech_key,
         settings.rp_default_email,
-        settings.rp_manager_email,
     )
     bundles = list((FRONTEND_DIST / "assets").glob("*.js"))
     assert bundles

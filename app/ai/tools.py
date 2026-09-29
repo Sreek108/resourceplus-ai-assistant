@@ -124,7 +124,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "type": "function",
         "name": "get_pending_approvals",
         "description": (
-            "Get pending supervisor approvals for the configured manager identity."
+            "Get pending supervisor approvals for the signed-in manager identity."
         ),
         "parameters": _empty_schema(),
         "strict": True,

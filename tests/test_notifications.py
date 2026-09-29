@@ -54,12 +54,14 @@ async def test_notification_service_uses_backend_identity_and_contract() -> None
     client = mock_client(handler)
     records = await get_notifications(
         usr_email="employee@example.com",
+        instance_name="Universal",
         client=client,
     )
     result = await update_notification_read_status(
         41,
         1,
         usr_email="employee@example.com",
+        instance_name="Universal",
         client=client,
     )
 

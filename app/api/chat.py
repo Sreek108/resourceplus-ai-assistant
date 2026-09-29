@@ -1,4 +1,4 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 
 from app.audit import (
     persist_audit,
@@ -8,6 +8,7 @@ from app.audit import (
     start_interaction_audit,
 )
 from app.models.schemas import ChatRequest, ChatResponse
+from app.identity import RequestIdentityError, resolve_request_identity
 from app.observability import measure_stage
 from app.services.chat import process_chat
 
@@ -16,6 +17,13 @@ router = APIRouter(prefix="/api", tags=["chat"])
 
 @router.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest) -> ChatResponse:
+    try:
+        resolve_request_identity(request.email, request.instance)
+    except RequestIdentityError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "invalid_identity", "message": str(exc)},
+        ) from exc
     audit, token = start_interaction_audit(
         input_mode="text",
         input_source="typed",

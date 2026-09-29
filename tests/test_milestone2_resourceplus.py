@@ -1,14 +1,13 @@
 import json
 import logging
 from datetime import date
-from types import SimpleNamespace
 
 import httpx
 import pytest
 
 from app.ai import tools as ai_tools
 from app.ai.tools import DateRange, execute_tool
-from app.resourceplus import approvals
+from app.identity import RequestIdentity, bind_request_identity, reset_request_identity
 from app.resourceplus.approvals import (
     approve_all_requests,
     approve_supervisor_request,
@@ -29,7 +28,7 @@ from app.resourceplus.requests import (
     ResourcePlusRequestStatusError,
     get_my_request_status,
 )
-from app.resourceplus.client import ResourcePlusClient, ResourcePlusConfigurationError
+from app.resourceplus.client import ResourcePlusClient
 
 
 def mock_client(handler) -> ResourcePlusClient:
@@ -92,6 +91,7 @@ async def test_missing_punch_reads_and_exceptional_entry_post_contract() -> None
         "2026-09-16",
         "2026-09-16",
         usr_email="employee@example.com",
+        instance_name="Universal",
         client=client,
     )
     reasons = await get_exception_reasons(client=client)
@@ -101,6 +101,7 @@ async def test_missing_punch_reads_and_exceptional_entry_post_contract() -> None
         reasons[0]["reasonID"],
         "Delayed due to traffic",
         usr_email="employee@example.com",
+        instance_name="Universal",
         client=client,
     )
     assert suggestions[0]["entryType"] == "IN"
@@ -134,6 +135,7 @@ async def test_exceptional_entry_rejects_invalid_time_before_post(
             "reason-real",
             "Traffic delay",
             usr_email="employee@example.com",
+            instance_name="Universal",
             client=mock_client(handler),
         )
 
@@ -165,6 +167,7 @@ async def test_exceptional_entry_serializes_live_server_post_body(
         "live-resourceplus-reason-guid",
         "Update Iqama In Bank",
         usr_email="employee@example.com",
+        instance_name="Universal",
         client=mock_client(handler),
     )
 
@@ -229,6 +232,7 @@ async def test_leave_endpoints_preserve_contract_and_conflict_message() -> None:
         "2026-09-22",
         "2026-09-24",
         usr_email="employee@example.com",
+        instance_name="Universal",
         client=client,
     )
     conflict = await book_day_type(
@@ -236,11 +240,13 @@ async def test_leave_endpoints_preserve_contract_and_conflict_message() -> None:
         "2026-09-24",
         day_types[0]["dayID"],
         usr_email="employee@example.com",
+        instance_name="Universal",
         client=client,
     )
     cancelled = await cancel_day_type_request(
         requests[0]["mappingID"],
         usr_email="employee@example.com",
+        instance_name="Universal",
         client=client,
     )
     assert conflict == {
@@ -374,17 +380,10 @@ async def test_request_status_tool_returns_only_a_safe_error(monkeypatch) -> Non
 
 @pytest.mark.asyncio
 async def test_supervisor_contract_preserves_request_type(monkeypatch) -> None:
-    monkeypatch.setattr(
-        approvals,
-        "get_settings",
-        lambda: SimpleNamespace(
-            rp_manager_email="manager@example.com",
-            rp_instance="Universal",
-        ),
-    )
     posts: list[dict] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.params["instanceName"] == "Universal"
         if request.method == "GET":
             assert request.url.params["usrEmail"] == "manager@example.com"
             return httpx.Response(
@@ -397,30 +396,24 @@ async def test_supervisor_contract_preserves_request_type(monkeypatch) -> None:
                 ],
             )
         body = __import__("json").loads(request.content)
+        assert body["usrEmail"] == "manager@example.com"
         posts.append(body)
         return httpx.Response(200, json={"success": True, "message": "Done"})
 
     client = mock_client(handler)
-    await get_pending_approvals(client=client)
-    await approve_supervisor_request(
-        "request-real",
-        "ExceptionEntry",
-        2,
-        client=client,
-    )
-    await approve_all_requests(1, "Absence", client=client)
+    token = bind_request_identity(RequestIdentity("manager@example.com", "Universal"))
+    try:
+        await get_pending_approvals(client=client)
+        await approve_supervisor_request(
+            "request-real",
+            "ExceptionEntry",
+            2,
+            client=client,
+        )
+        await approve_all_requests(1, "Absence", client=client)
+    finally:
+        reset_request_identity(token)
     assert posts[0]["requestType"] == "ExceptionEntry"
     assert posts[0]["status"] == 2
     assert posts[1]["requestType"] == "Absence"
     assert posts[1]["status"] == 1
-
-
-@pytest.mark.asyncio
-async def test_supervisor_requires_configured_manager(monkeypatch) -> None:
-    monkeypatch.setattr(
-        approvals,
-        "get_settings",
-        lambda: SimpleNamespace(rp_manager_email=None, rp_instance="Universal"),
-    )
-    with pytest.raises(ResourcePlusConfigurationError, match="RP_MANAGER_EMAIL"):
-        await get_pending_approvals(client=mock_client(lambda request: None))
