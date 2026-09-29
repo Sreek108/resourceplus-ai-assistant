@@ -172,6 +172,8 @@ async def run_agent(
                             resolved_range=resolved_range,
                             source_user_message=message,
                         )
+                        if not result.tool_used and tool_call.name in ALLOWED_TOOL_NAMES:
+                            tools_used.pop()
                         result_output = result.output
                         failed = result.failed
                         if result.pending_action is not None:

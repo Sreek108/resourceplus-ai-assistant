@@ -36,6 +36,7 @@ class ExceptionalEntryDraft:
     language: str
     created_at: datetime
     expires_at: datetime
+    reason_options: tuple[str, ...] = ()
 
 
 @dataclass
@@ -45,6 +46,7 @@ class _SessionState:
     history: list[HistoryItem] = field(default_factory=list)
     pending_action: PendingAction | None = None
     exceptional_entry_draft: ExceptionalEntryDraft | None = None
+    exceptional_entry_history_start: int | None = None
     expired_pending_language: str | None = None
     expired_pending_action_type: str | None = None
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -88,6 +90,7 @@ class SessionStore(Protocol):
         entry_type: str,
         suggested_entry_time: str,
         language: str,
+        reason_options: list[str] | tuple[str, ...] | None = None,
     ) -> ExceptionalEntryDraft: ...
 
     def get_exceptional_entry_draft(
@@ -157,6 +160,7 @@ class InMemorySessionStore:
             language=draft.language,
             created_at=draft.created_at,
             expires_at=draft.expires_at,
+            reason_options=draft.reason_options,
         )
 
     def _remove_stale_sessions(self, current: datetime) -> None:
@@ -175,6 +179,14 @@ class InMemorySessionStore:
                 "The conversation does not belong to the current demo identity."
             )
         return state
+
+    @staticmethod
+    def _abandon_exceptional_entry_draft(state: _SessionState) -> None:
+        history_start = state.exceptional_entry_history_start
+        if history_start is not None:
+            del state.history[history_start:]
+        state.exceptional_entry_draft = None
+        state.exceptional_entry_history_start = None
 
     def ensure_session(self, session_id: str | None = None) -> str:
         with self._lock:
@@ -223,6 +235,7 @@ class InMemorySessionStore:
             state = self._sessions[session_id]
             state.pending_action = action
             state.exceptional_entry_draft = None
+            state.exceptional_entry_history_start = None
             state.expired_pending_language = None
             state.expired_pending_action_type = None
             state.updated_at = current
@@ -236,6 +249,7 @@ class InMemorySessionStore:
         entry_type: str,
         suggested_entry_time: str,
         language: str,
+        reason_options: list[str] | tuple[str, ...] | None = None,
     ) -> ExceptionalEntryDraft:
         if entry_type not in {"IN", "OUT"}:
             raise ValueError("Exceptional-entry draft direction must be IN or OUT.")
@@ -243,6 +257,11 @@ class InMemorySessionStore:
             raise ValueError("Exceptional-entry draft language must be en or ar.")
         if not attendance_date or not suggested_entry_time:
             raise ValueError("Exceptional-entry draft selection is incomplete.")
+        normalized_reason_options = tuple(
+            option.strip()
+            for option in (reason_options or ())
+            if isinstance(option, str) and option.strip()
+        )
         with self._lock:
             self.ensure_session(session_id)
             current = self._now()
@@ -253,8 +272,11 @@ class InMemorySessionStore:
                 language=language,
                 created_at=current,
                 expires_at=current + self.confirmation_ttl,
+                reason_options=normalized_reason_options,
             )
             state = self._sessions[session_id]
+            if state.exceptional_entry_draft is None:
+                state.exceptional_entry_history_start = len(state.history)
             state.exceptional_entry_draft = draft
             state.updated_at = current
             return self._clone_draft(draft)
@@ -269,7 +291,7 @@ class InMemorySessionStore:
                 return None
             current = self._now()
             if current >= state.exceptional_entry_draft.expires_at:
-                state.exceptional_entry_draft = None
+                self._abandon_exceptional_entry_draft(state)
                 state.updated_at = current
                 return None
             return self._clone_draft(state.exceptional_entry_draft)
@@ -283,7 +305,7 @@ class InMemorySessionStore:
             if state is None or state.exceptional_entry_draft is None:
                 return None
             draft = self._clone_draft(state.exceptional_entry_draft)
-            state.exceptional_entry_draft = None
+            self._abandon_exceptional_entry_draft(state)
             state.updated_at = self._now()
             return draft
 
@@ -365,7 +387,14 @@ class InMemorySessionStore:
             self.ensure_session(session_id)
             state = self._sessions[session_id]
             state.history.append({"role": role, "content": content})
-            state.history = state.history[-self.history_limit :]
+            overflow = max(0, len(state.history) - self.history_limit)
+            if overflow:
+                state.history = state.history[overflow:]
+                if state.exceptional_entry_history_start is not None:
+                    state.exceptional_entry_history_start = max(
+                        0,
+                        state.exceptional_entry_history_start - overflow,
+                    )
             state.updated_at = self._now()
 
     def clear(self) -> None:

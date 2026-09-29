@@ -111,6 +111,12 @@ async def test_missing_reason_lists_live_reasons_without_pending_or_default(
     assert draft.entry_type == "IN"
     assert draft.suggested_entry_time == "01/09/2026 08:00"
     assert draft.language == "en"
+    assert draft.reason_options == (
+        "Exception Generation",
+        "Embassy Purposes",
+        "Family Circumstances",
+        "Other",
+    )
     assert audit.action_type is None
     assert audit.action_state == "none"
     assert audit.confirmation_required is False
@@ -209,13 +215,19 @@ def _store_reason_draft(
     session_id: str,
     *,
     language: str = "en",
+    entry_type: str = "IN",
+    reason_options: list[str] | None = None,
 ) -> None:
     store.create_exceptional_entry_draft(
         session_id,
         attendance_date="2026-09-01",
-        entry_type="IN",
-        suggested_entry_time="01/09/2026 08:00",
+        entry_type=entry_type,
+        suggested_entry_time=(
+            "01/09/2026 08:00" if entry_type == "IN" else "01/09/2026 17:00"
+        ),
         language=language,
+        reason_options=reason_options
+        or ["Embassy Purposes", "Family Circumstances", "Other"],
     )
 
 
@@ -368,10 +380,12 @@ async def test_unknown_or_ambiguous_draft_reason_stops_without_loop(
 
 
 @pytest.mark.asyncio
-async def test_greeting_clears_draft_and_uses_normal_conversation(monkeypatch) -> None:
+async def test_greeting_retains_draft_and_uses_normal_conversation(monkeypatch) -> None:
     store = InMemorySessionStore()
     session_id = store.ensure_session("draft-greeting")
     _store_reason_draft(store, session_id)
+    store.append_history(session_id, "user", "I forgot to punch in today.")
+    store.append_history(session_id, "assistant", "What was the reason?")
     agent_calls = 0
 
     async def normal_agent(*args, **kwargs):
@@ -390,13 +404,238 @@ async def test_greeting_clears_draft_and_uses_normal_conversation(monkeypatch) -
         no_draft_reads,
     )
     response = await chat_service.process_chat(
-        ChatRequest(message="hello", session_id=session_id),
+        ChatRequest(message="Hello, how are you?", session_id=session_id),
         detected_language="en",
         store=store,
     )
 
     assert response.message == "Hello! How can I help?"
     assert agent_calls == 1
+    assert store.get_exceptional_entry_draft(session_id) is not None
+    assert store.get_pending_action(session_id)[0] is None
+    assert store.get_history(session_id)[0] == {
+        "role": "user",
+        "content": "I forgot to punch in today.",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("message", "agent_message", "tool_name"),
+    [
+        ("My punch is missing today.", "Which punch is missing?", "prepare_exceptional_entry"),
+        ("Show my attendance.", "Your attendance is ready.", "get_attendance_summary"),
+        ("Show my profile.", "Your profile is ready.", "get_profile_data"),
+    ],
+)
+async def test_supported_hr_intent_abandons_reason_draft_and_routes_normally(
+    monkeypatch,
+    message: str,
+    agent_message: str,
+    tool_name: str,
+) -> None:
+    store = InMemorySessionStore()
+    session_id = store.ensure_session(f"draft-new-intent-{tool_name}")
+    _store_reason_draft(store, session_id, entry_type="OUT")
+    store.append_history(session_id, "user", "I forgot to punch out today.")
+    store.append_history(session_id, "assistant", "What was the reason?")
+    agent_calls = 0
+
+    async def normal_agent(user_message, *args, **kwargs):
+        nonlocal agent_calls
+        agent_calls += 1
+        assert user_message == message
+        assert kwargs["history"] == []
+        assert store.get_exceptional_entry_draft(session_id) is None
+        return AgentResult(agent_message, [tool_name], speech_message=agent_message)
+
+    async def no_reason_follow_up(*args, **kwargs):
+        raise AssertionError("A new HR intent must not be consumed as a reason")
+
+    async def no_resourceplus_write(**kwargs):
+        raise AssertionError("The abandoned draft must never cause a ResourcePlus write")
+
+    monkeypatch.setattr(chat_service, "run_agent", normal_agent)
+    monkeypatch.setattr(
+        chat_service,
+        "prepare_exceptional_entry_reason_follow_up",
+        no_reason_follow_up,
+    )
+    monkeypatch.setattr(actions, "create_exceptional_entry", no_resourceplus_write)
+    response = await chat_service.process_chat(
+        ChatRequest(message=message, session_id=session_id),
+        detected_language="en",
+        store=store,
+    )
+
+    assert response.message == agent_message
+    assert "couldn't match that reason" not in response.message
+    assert agent_calls == 1
+    assert store.get_exceptional_entry_draft(session_id) is None
+    assert store.get_pending_action(session_id)[0] is None
+
+
+@pytest.mark.asyncio
+async def test_profile_intent_permanently_abandons_old_out_draft(monkeypatch) -> None:
+    store = InMemorySessionStore()
+    session_id = store.ensure_session("draft-profile-then-old-reason")
+    _store_reason_draft(
+        store,
+        session_id,
+        entry_type="OUT",
+        reason_options=["Outside Work", "Family Circumstances", "Other"],
+    )
+    store.append_history(session_id, "user", "I forgot to punch out today.")
+    store.append_history(
+        session_id,
+        "assistant",
+        "What was the reason? Outside Work, Family Circumstances, or Other?",
+    )
+    agent_calls: list[str] = []
+    write_calls = 0
+
+    async def normal_agent(user_message, *args, **kwargs):
+        agent_calls.append(user_message)
+        if user_message == "Show my profile":
+            assert kwargs["history"] == []
+            return AgentResult("Your profile is ready.", ["get_profile_data"])
+        assert user_message == "Outside Work"
+        assert kwargs["history"] == [
+            {"role": "user", "content": "Show my profile"},
+            {"role": "assistant", "content": "Your profile is ready."},
+        ]
+        return AgentResult("How can I help with that?", [])
+
+    async def no_reason_follow_up(*args, **kwargs):
+        raise AssertionError("An abandoned draft must not resume reason selection")
+
+    async def no_resourceplus_write(**kwargs):
+        nonlocal write_calls
+        write_calls += 1
+        raise AssertionError("An abandoned draft must never write to ResourcePlus")
+
+    monkeypatch.setattr(chat_service, "run_agent", normal_agent)
+    monkeypatch.setattr(
+        chat_service,
+        "prepare_exceptional_entry_reason_follow_up",
+        no_reason_follow_up,
+    )
+    monkeypatch.setattr(actions, "create_exceptional_entry", no_resourceplus_write)
+
+    profile_response = await chat_service.process_chat(
+        ChatRequest(message="Show my profile", session_id=session_id),
+        detected_language="en",
+        store=store,
+    )
+    assert profile_response.tools_used == ["get_profile_data"]
+    assert store.get_exceptional_entry_draft(session_id) is None
+
+    later_response = await chat_service.process_chat(
+        ChatRequest(message="Outside Work", session_id=session_id),
+        detected_language="en",
+        store=store,
+    )
+
+    assert later_response.requires_confirmation is False
+    assert "prepare_exceptional_entry" not in later_response.tools_used
+    assert store.get_exceptional_entry_draft(session_id) is None
+    assert store.get_pending_action(session_id)[0] is None
+    assert write_calls == 0
+    assert agent_calls == ["Show my profile", "Outside Work"]
+
+
+@pytest.mark.asyncio
+async def test_waiting_for_reason_routes_prospective_lateness_without_old_action(
+    monkeypatch,
+) -> None:
+    store = InMemorySessionStore()
+    session_id = store.ensure_session("draft-prospective-late")
+    _store_reason_draft(store, session_id, entry_type="OUT")
+    store.append_history(session_id, "user", "I forgot to punch out today.")
+    store.append_history(session_id, "assistant", "What was the reason?")
+
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("Late arrival must not enter the reason or agent tool flow")
+
+    monkeypatch.setattr(chat_service, "run_agent", forbidden)
+    monkeypatch.setattr(
+        chat_service,
+        "prepare_exceptional_entry_reason_follow_up",
+        forbidden,
+    )
+    response = await chat_service.process_chat(
+        ChatRequest(
+            message="I'll be 20 minutes late today.",
+            session_id=session_id,
+        ),
+        detected_language="en",
+        store=store,
+    )
+
+    assert "isn't connected yet" in response.message
+    assert store.get_exceptional_entry_draft(session_id) is None
+    assert store.get_pending_action(session_id)[0] is None
+    assert all(
+        "forgot to punch out" not in item["content"]
+        for item in store.get_history(session_id)
+    )
+
+
+@pytest.mark.asyncio
+async def test_short_invalid_reason_like_text_still_lists_live_options(
+    monkeypatch,
+) -> None:
+    calls = _install_counted_reason_follow_up(monkeypatch)
+    store = InMemorySessionStore()
+    session_id = store.ensure_session("draft-invalid-reason-like")
+    _store_reason_draft(store, session_id)
+
+    async def no_agent(*args, **kwargs):
+        raise AssertionError("A reason-like reply must stay in deterministic reason flow")
+
+    monkeypatch.setattr(chat_service, "run_agent", no_agent)
+    response = await chat_service.process_chat(
+        ChatRequest(message="Traffic jam", session_id=session_id),
+        detected_language="en",
+        store=store,
+    )
+
+    assert "couldn't match that reason" in response.message
+    assert response.needs_reason is True
+    assert response.reason_options
+    assert calls == {"suggestions": 1, "reasons": 1, "posts": 0}
+    assert store.get_exceptional_entry_draft(session_id) is not None
+    assert store.get_pending_action(session_id)[0] is None
+
+
+@pytest.mark.asyncio
+async def test_arabic_missing_punch_intent_is_not_consumed_as_reason(monkeypatch) -> None:
+    store = InMemorySessionStore()
+    session_id = store.ensure_session("draft-arabic-new-intent")
+    _store_reason_draft(store, session_id, language="ar", entry_type="OUT")
+    message = "بصمتي ناقصة اليوم"
+
+    async def normal_agent(user_message, *args, **kwargs):
+        assert user_message == message
+        assert kwargs["history"] == []
+        return AgentResult("أي بصمة تريد تصحيحها؟", ["prepare_exceptional_entry"])
+
+    async def no_reason_follow_up(*args, **kwargs):
+        raise AssertionError("Arabic HR intent must not be consumed as a reason")
+
+    monkeypatch.setattr(chat_service, "run_agent", normal_agent)
+    monkeypatch.setattr(
+        chat_service,
+        "prepare_exceptional_entry_reason_follow_up",
+        no_reason_follow_up,
+    )
+    response = await chat_service.process_chat(
+        ChatRequest(message=message, session_id=session_id),
+        detected_language="ar",
+        store=store,
+    )
+
+    assert response.message == "أي بصمة تريد تصحيحها؟"
     assert store.get_exceptional_entry_draft(session_id) is None
     assert store.get_pending_action(session_id)[0] is None
 
@@ -492,7 +731,9 @@ async def test_later_user_reason_is_revalidated_and_creates_pending_action(
             lang=1,
             session_id=session_id,
             response_language="en",
-            source_user_message="Family Circumstances",
+            source_user_message=(
+                "Correct my IN punch because of Family Circumstances"
+            ),
             store=store,
         )
     finally:

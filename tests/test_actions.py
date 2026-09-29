@@ -298,7 +298,7 @@ async def test_live_suggestion_is_authoritative_without_attendance_prefilter(
         lang=1,
         session_id=session_id,
         response_language="en",
-        source_user_message="traffic",
+        source_user_message="Correct my missing punch because of traffic",
         store=store,
     )
 
@@ -393,7 +393,9 @@ async def test_unknown_live_reason_requires_clarification_without_pending_action
         lang=1,
         session_id=session_id,
         response_language="en",
-        source_user_message="unsupported reason",
+        source_user_message=(
+            "Correct my missing punch because of an unsupported reason"
+        ),
         store=store,
     )
 
@@ -441,7 +443,7 @@ async def test_ambiguous_live_reason_asks_user_without_exposing_ids(monkeypatch)
         lang=1,
         session_id=session_id,
         response_language="en",
-        source_user_message="family issue",
+        source_user_message="Correct my missing punch because of a family issue",
         store=store,
     )
 
@@ -484,7 +486,9 @@ async def test_exceptional_entry_yes_executes_exact_pending_arguments(
         lang=1,
         session_id=session_id,
         response_language="en",
-        source_user_message="family circumstance",
+        source_user_message=(
+            "Correct my missing punch because of a family circumstance"
+        ),
         store=store,
     )
     pending = prepared.pending_action
@@ -1073,3 +1077,76 @@ async def test_write_intent_tool_creates_pending_confirmation(monkeypatch) -> No
     assert result.pending_action is not None
     assert pending is not None
     assert pending.validated_arguments["day_type_id"] == 20
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "arguments"),
+    [
+        (
+            "prepare_exceptional_entry",
+            {
+                "target_date": "2026-09-29",
+                "punch_direction": "OUT",
+                "reason_name": None,
+                "remarks": None,
+            },
+        ),
+        (
+            "prepare_book_day_type",
+            {
+                "date_from": "2026-09-29",
+                "date_to": "2026-09-29",
+                "day_type_name": "Annual Leave",
+            },
+        ),
+        (
+            "prepare_cancel_day_type_request",
+            {
+                "day_type_name": "Annual Leave",
+                "date_from": "2026-09-29",
+                "date_to": None,
+            },
+        ),
+        (
+            "prepare_supervisor_request",
+            {"employee_name": "Employee", "detail": None, "decision": "approve"},
+        ),
+        (
+            "prepare_approve_all_requests",
+            {"decision": "approve", "request_type": "all"},
+        ),
+        (
+            "prepare_notification_read_status",
+            {"target": "all", "notification_title": None, "read_status": 1},
+        ),
+    ],
+)
+async def test_ambiguous_source_cannot_start_any_write_preparation(
+    monkeypatch,
+    tool_name: str,
+    arguments: dict,
+) -> None:
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("An ungrounded model guess must not prepare a write")
+
+    monkeypatch.setattr(ai_tools, "prepare_write_action", forbidden)
+    store = InMemorySessionStore()
+    session_id = store.ensure_session(f"ungrounded-{tool_name}")
+
+    result = await execute_tool(
+        tool_name,
+        arguments,
+        lang=1,
+        session_id=session_id,
+        response_language="en",
+        source_user_message="I forgot to Punjab Today.",
+        store=store,
+    )
+
+    payload = json.loads(result.output)
+    assert payload["prepared"] is False
+    assert payload["requires_confirmation"] is False
+    assert result.tool_used is False
+    assert result.pending_action is None
+    assert store.get_pending_action(session_id)[0] is None

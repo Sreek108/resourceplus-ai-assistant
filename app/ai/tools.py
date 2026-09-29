@@ -7,6 +7,13 @@ from datetime import date, timedelta
 from typing import Any
 
 from app.ai.actions import ActionResolutionRequired, prepare_write_action
+from app.ai.attendance_intent import (
+    explicit_missing_punch_direction,
+    is_existing_late_punch,
+    is_explicit_missing_punch_correction,
+    is_prospective_late_arrival,
+    late_arrival_unavailable_message,
+)
 from app.ai.sessions import PendingAction, SessionStore, session_store
 from app.audit import record_action_state, record_safe_error, record_tool_usage
 from app.resourceplus import ResourcePlusError
@@ -144,6 +151,10 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "name": "prepare_exceptional_entry",
         "description": (
             "Prepare, but do not submit, a less-hours exceptional-entry correction. "
+            "Use only for an explicit forgotten/missing punch or a request to correct "
+            "an existing attendance record. Never use for an expected current/future "
+            "late arrival or an already-completed late IN punch, even when the employee "
+            "mentions punching in late. "
             "Call this directly for a correction request; do not prefetch suggestions "
             "or reasons. The backend reads suggestions once, resolves one exact punch, "
             "then reads live reasons only when an actionable suggestion exists. Call "
@@ -165,8 +176,10 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "type": ["string", "null"],
                     "enum": ["IN", "OUT", None],
                     "description": (
-                        "IN or OUT only when the employee explicitly selected one; "
-                        "otherwise null. This never supplies the correction time."
+                        "IN or OUT only when the employee explicitly selected or stated "
+                        "that missing direction; otherwise null. Preserve explicit "
+                        "punch-in/punch-out wording exactly. The backend re-grounds this "
+                        "from the user message. This never supplies the correction time."
                     ),
                 },
                 "reason_name": {
@@ -342,10 +355,80 @@ class DateRange:
 class ToolExecutionResult:
     output: str
     failed: bool = False
+    tool_used: bool = True
     pending_action: PendingAction | None = None
     terminal_message: str | None = None
     needs_reason: bool = False
     reason_options: list[str] | None = None
+
+
+def _write_intent_is_grounded(tool_name: str, message: str) -> bool:
+    """Require explicit user language before any write preparation can begin."""
+
+    normalized = " ".join(message.casefold().replace("’", "'").split())
+    if not normalized:
+        return False
+
+    if tool_name == "prepare_exceptional_entry":
+        if is_explicit_missing_punch_correction(message):
+            return True
+        return bool(
+            re.search(
+                r"\b(?:correct|fix|adjust|amend|regulari[sz]e)\b.{0,40}"
+                r"\b(?:less\s+hours?|shortfall|attendance)\b",
+                normalized,
+            )
+        )
+
+    if tool_name == "prepare_book_day_type":
+        return bool(
+            re.search(r"\b(?:apply|request|book|take)\b", normalized)
+            and re.search(
+                r"\b(?:leave|vacation|day\s+off|absence|business\s+travel)\b",
+                normalized,
+            )
+        ) or (
+            any(cue in normalized for cue in ("أبغى", "ابغى", "اريد", "أريد", "قدم", "تقديم"))
+            and any(cue in normalized for cue in ("إجاز", "اجاز", "سفر", "غياب"))
+        )
+
+    if tool_name == "prepare_cancel_day_type_request":
+        return (
+            bool(re.search(r"\b(?:cancel|withdraw)\b", normalized))
+            and bool(re.search(r"\b(?:leave|vacation|absence|request|travel)\b", normalized))
+        ) or (
+            any(cue in normalized for cue in ("إلغاء", "الغاء", "اسحب", "سحب"))
+            and any(cue in normalized for cue in ("إجاز", "اجاز", "طلب", "سفر", "غياب"))
+        )
+
+    if tool_name in {"prepare_supervisor_request", "prepare_approve_all_requests"}:
+        return bool(re.search(r"\b(?:approve|reject)\b", normalized)) or any(
+            cue in normalized for cue in ("وافق", "موافقة", "ارفض", "رفض")
+        )
+
+    if tool_name == "prepare_notification_read_status":
+        return (
+            bool(re.search(r"\b(?:mark|read|unread)\b", normalized))
+            and bool(re.search(r"\b(?:notification|alert)s?\b", normalized))
+        ) or (
+            any(cue in normalized for cue in ("مقروء", "غير مقروء", "اقرأ"))
+            and any(cue in normalized for cue in ("إشعار", "اشعار", "تنبيه"))
+        )
+
+    return False
+
+
+def _ungrounded_write_message(tool_name: str, language: str) -> str:
+    if tool_name == "prepare_exceptional_entry":
+        if language == "ar":
+            return "ما فهمت طلب تصحيح البصمة بوضوح. هل نسيت تسجيل الدخول أو الخروج؟"
+        return (
+            "I didn't catch that clearly. Did you mean you forgot to punch in "
+            "or punch out?"
+        )
+    if language == "ar":
+        return "ما فهمت بوضوح الإجراء الذي تريد تنفيذه. فضلاً أعد الطلب بشكل أوضح."
+    return "I didn't catch a clear request to change anything. Please repeat your request."
 
 
 def resolve_relative_date_range(
@@ -464,6 +547,60 @@ async def execute_tool(
             failed=True,
         )
 
+    existing_late_punch = (
+        source_user_message is not None
+        and is_existing_late_punch(source_user_message)
+    )
+    if (
+        name in {"get_missing_punch_suggestions", "prepare_exceptional_entry"}
+        and source_user_message is not None
+        and (
+            existing_late_punch
+            or is_prospective_late_arrival(source_user_message)
+        )
+    ):
+        message = late_arrival_unavailable_message(
+            response_language,
+            already_punched=existing_late_punch,
+        )
+        return ToolExecutionResult(
+            json.dumps(
+                {
+                    "success": True,
+                    "prepared": False,
+                    "requires_confirmation": False,
+                    "message": message,
+                },
+                ensure_ascii=False,
+            ),
+            terminal_message=message,
+        )
+
+    if name in WRITE_INTENT_TOOL_NAMES and source_user_message is not None:
+        existing_draft = (
+            store.get_exceptional_entry_draft(session_id)
+            if name == "prepare_exceptional_entry"
+            else None
+        )
+        if existing_draft is None and not _write_intent_is_grounded(
+            name,
+            source_user_message,
+        ):
+            message = _ungrounded_write_message(name, response_language)
+            return ToolExecutionResult(
+                json.dumps(
+                    {
+                        "success": True,
+                        "prepared": False,
+                        "requires_confirmation": False,
+                        "message": message,
+                    },
+                    ensure_ascii=False,
+                ),
+                tool_used=False,
+                terminal_message=message,
+            )
+
     record_tool_usage(name)
     try:
         if name == "get_attendance_summary":
@@ -497,6 +634,13 @@ async def execute_tool(
             intent_arguments = dict(arguments)
             if name == "prepare_exceptional_entry" and source_user_message is not None:
                 intent_arguments["_user_message"] = source_user_message
+                if is_explicit_missing_punch_correction(source_user_message):
+                    # The original user wording is authoritative. Override both a
+                    # conflicting model direction and an invented direction for an
+                    # otherwise ambiguous correction request.
+                    intent_arguments["punch_direction"] = (
+                        explicit_missing_punch_direction(source_user_message)
+                    )
             if resolved_range and name == "prepare_exceptional_entry":
                 intent_arguments["_range_from"] = resolved_range.from_date.isoformat()
                 intent_arguments["_range_to"] = resolved_range.to_date.isoformat()
@@ -556,6 +700,7 @@ async def execute_tool(
                 entry_type=exc.draft_context["entry_type"],
                 suggested_entry_time=exc.draft_context["suggested_entry_time"],
                 language=exc.draft_context["language"],
+                reason_options=exc.reason_options,
             )
         needs_reason = exc.category in {
             "reason_required",

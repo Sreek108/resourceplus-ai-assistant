@@ -5,6 +5,14 @@ from app.ai.actions import (
     execute_pending_action,
     prepare_exceptional_entry_reason_follow_up,
 )
+from app.ai.attendance_intent import (
+    is_ambiguous_transactional_utterance,
+    is_existing_late_punch,
+    is_explicit_missing_punch_correction,
+    is_prospective_late_arrival,
+    late_arrival_unavailable_message,
+)
+from app.ai.reason_matcher import deterministic_reason_match
 from app.ai.agent import (
     AgentResult,
     OpenAIServiceError,
@@ -116,6 +124,27 @@ DRAFT_TOPIC_STARTERS = {
     "هل",
 }
 
+SUPPORTED_HR_TOPIC = re.compile(
+    r"\b(?:attendance|profile|leave|vacation|holiday|notification|alert|approval|"
+    r"request(?:s|\s+status)?|balance|payslip|salary|business\s+travel)\b",
+    flags=re.IGNORECASE,
+)
+SUPPORTED_ARABIC_HR_TERMS = (
+    "\u0627\u0644\u062d\u0636\u0648\u0631",  # attendance
+    "\u0645\u0644\u0641\u064a",  # my profile
+    "\u0627\u0644\u0645\u0644\u0641",  # profile
+    "\u0625\u062c\u0627\u0632",  # leave (hamza spelling)
+    "\u0627\u062c\u0627\u0632",  # leave (plain spelling)
+    "\u0637\u0644\u0628\u0627\u062a",  # requests
+    "\u0637\u0644\u0628\u0627\u062a\u064a",  # my requests
+    "\u0625\u0634\u0639\u0627\u0631",  # notification (hamza spelling)
+    "\u0627\u0634\u0639\u0627\u0631",  # notification (plain spelling)
+    "\u062a\u0646\u0628\u064a\u0647",  # alert
+    "\u0645\u0648\u0627\u0641\u0642",  # approval root
+    "\u0631\u0635\u064a\u062f",  # balance
+    "\u0631\u0627\u062a\u0628",  # salary
+)
+
 ACTION_RESULT_MESSAGES = {
     "create_exceptional_entry": {
         "submitted_for_approval": {
@@ -159,21 +188,43 @@ def _normalized_reply(message: str) -> str:
     return re.sub(r"\s+", " ", normalized)
 
 
-def _draft_follow_up_kind(message: str) -> str:
-    """Conservatively separate a short reason phrase from clear topic changes."""
+def _is_clear_supported_hr_intent(message: str) -> bool:
+    if is_explicit_missing_punch_correction(message):
+        return True
+    if SUPPORTED_HR_TOPIC.search(message):
+        return True
+    normalized = _normalized_reply(message)
+    return any(term in normalized for term in SUPPORTED_ARABIC_HR_TERMS)
+
+
+def _draft_follow_up_kind(
+    message: str,
+    reason_options: tuple[str, ...] = (),
+) -> str:
+    """Separate a reason answer from a new request or ordinary conversation."""
 
     normalized = _normalized_reply(message)
     if normalized in DRAFT_CANCELLATIONS:
         return "cancel"
-    if normalized in DRAFT_GREETINGS:
-        return "topic_change"
+    # These initial live labels are routing hints only. The reason workflow still
+    # refetches ResourcePlus data and revalidates the selection before creating
+    # an immutable PendingAction.
+    if deterministic_reason_match(message, list(reason_options)).index is not None:
+        return "reason"
+    if _is_clear_supported_hr_intent(message):
+        return "new_intent"
+    if normalized in DRAFT_GREETINGS or any(
+        normalized.startswith(f"{greeting} ")
+        for greeting in DRAFT_GREETINGS
+    ):
+        return "casual"
     words = re.findall(r"[^\W_]+", message, flags=re.UNICODE)
     if not words:
-        return "topic_change"
+        return "casual"
     if words[0].casefold() in DRAFT_TOPIC_STARTERS:
-        return "topic_change"
+        return "casual"
     if "?" in message or "؟" in message or len(words) > 6:
-        return "topic_change"
+        return "casual"
     return "reason"
 
 
@@ -553,9 +604,48 @@ async def _process_chat(
             confirmation_id=pending.confirmation_id,
         ).set_speech_message(message)
 
+    if is_ambiguous_transactional_utterance(request.message):
+        message = (
+            "ما فهمت طلبك بوضوح. ممكن تعيده وتوضح الإجراء الذي تريده؟"
+            if language == "ar"
+            else (
+                "I didn't catch that clearly. Please repeat what you'd like me "
+                "to help with."
+            )
+        )
+        store.append_history(session_id, "user", request.message)
+        store.append_history(session_id, "assistant", message)
+        return ChatResponse(
+            success=True,
+            message=message,
+            language=language,
+            session_id=session_id,
+        ).set_speech_message(message)
+
+    existing_late_punch = is_existing_late_punch(request.message)
+    if existing_late_punch or is_prospective_late_arrival(request.message):
+        # A prospective arrival delay is not an existing attendance record to repair.
+        # Clear only a non-executable reason draft so it cannot hijack this new topic.
+        store.clear_exceptional_entry_draft(session_id)
+        message = late_arrival_unavailable_message(
+            language,
+            already_punched=existing_late_punch,
+        )
+        store.append_history(session_id, "user", request.message)
+        store.append_history(session_id, "assistant", message)
+        return ChatResponse(
+            success=True,
+            message=message,
+            language=language,
+            session_id=session_id,
+        ).set_speech_message(message)
+
     draft = store.get_exceptional_entry_draft(session_id)
     if draft is not None:
-        draft_follow_up = _draft_follow_up_kind(request.message)
+        draft_follow_up = _draft_follow_up_kind(
+            request.message,
+            draft.reason_options,
+        )
         if draft_follow_up == "cancel":
             store.clear_exceptional_entry_draft(session_id)
             message = _draft_cancelled_message(draft.language)
@@ -659,10 +749,16 @@ async def _process_chat(
                 confirmation_id=pending_action.confirmation_id,
             ).set_speech_message(message)
 
-        # An explicit topic change abandons this non-executable draft so it cannot
-        # hijack later turns. The ordinary agent remains responsible for the new topic.
-        store.clear_exceptional_entry_draft(session_id)
-        ignore_prior_history_for_topic_change = True
+        if draft_follow_up == "new_intent":
+            # Abandon only the non-executable draft and isolate the new request from
+            # its stale selection context. PendingAction handling occurred above and
+            # is intentionally unaffected by this branch.
+            store.clear_exceptional_entry_draft(session_id)
+            ignore_prior_history_for_topic_change = True
+        elif draft_follow_up == "casual":
+            # Keep the recoverable draft, but do not feed its reason-question history
+            # into this ordinary conversational turn.
+            ignore_prior_history_for_topic_change = True
 
     if expired or decision in {"CONFIRM", "REJECT"}:
         message = _confirmation_message(

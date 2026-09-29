@@ -376,11 +376,16 @@ async def _prepare_exceptional_entry(
             if target_date is not None
             else "in that period"
         )
-        direction = f" {requested_direction}" if requested_direction else ""
-        message = (
-            f"ResourcePlus does not currently provide a valid{direction} suggested "
-            f"punch correction {scope}."
-        )
+        if requested_direction is not None:
+            message = (
+                f"I couldn't find a missing {requested_direction} punch {scope} "
+                "in ResourcePlus."
+            )
+        else:
+            message = (
+                "ResourcePlus does not currently provide a valid suggested punch "
+                f"correction {scope}."
+            )
         raise ActionResolutionRequired(
             message,
             category="no_resourceplus_suggestion",

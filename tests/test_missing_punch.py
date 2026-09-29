@@ -134,7 +134,7 @@ async def test_same_date_in_and_out_are_shown_then_require_direction(
         lang=1,
         session_id=session_id,
         response_language="en",
-        source_user_message="traffic",
+        source_user_message="Correct my missing punch because of traffic",
         store=store,
     )
     body = json.loads(clarification.output)
@@ -155,7 +155,7 @@ async def test_same_date_in_and_out_are_shown_then_require_direction(
         lang=1,
         session_id=session_id,
         response_language="en",
-        source_user_message="traffic",
+        source_user_message="Correct my missing IN punch because of traffic",
         store=store,
     )
     assert prepared.pending_action is not None
@@ -235,7 +235,7 @@ async def test_empty_time_rows_remain_visible_but_are_not_correctable(
         lang=1,
         session_id=store.ensure_session("uat-empty-time-prepare"),
         response_language="en",
-        source_user_message="traffic",
+        source_user_message="Correct my missing punch because of traffic",
         store=store,
     )
     assert result.pending_action is None
@@ -295,7 +295,7 @@ async def test_mixed_in_correctable_out_informational_only(monkeypatch) -> None:
         lang=1,
         session_id=store.ensure_session("mixed-prepare"),
         response_language="en",
-        source_user_message="traffic",
+        source_user_message="Correct my missing punch because of traffic",
         store=store,
     )
     assert prepared.pending_action is not None
