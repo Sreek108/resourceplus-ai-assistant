@@ -839,10 +839,10 @@ async def test_english_transaction_ignores_arabic_resourceplus_success(monkeypat
     assert executions[0] == pending.validated_arguments
     assert response.language == "en"
     assert response.message == (
-        "Your exceptional-entry request was submitted successfully for approval."
+        "Your exceptional-entry request was submitted for approval."
     )
     assert response.speech_message == (
-        "Your exceptional-entry request was submitted for approval successfully."
+        "Your exceptional-entry request was submitted for approval."
     )
     assert "تم تسجيل" not in response.message
     assert audit.action_state == "executed"

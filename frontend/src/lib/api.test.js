@@ -254,4 +254,101 @@ describe("safe API errors", () => {
     expect(caught.message).toContain(expectedMessage);
     expect(caught.message).not.toContain("internal");
   });
+
+  it("returns an explicitly completed voice result when only TTS failed", async () => {
+    const completed = {
+      success: true,
+      message: "Confirm the 10-minute correction.",
+      language: "en",
+      session_id: "tts-session",
+      requires_confirmation: true,
+      confirmation_id: "tts-confirmation",
+      blocks: [
+        {
+          type: "table",
+          title: "Correction",
+          columns: [{ key: "date", label: "Date" }],
+          rows: [{ date: "2026-09-10" }],
+        },
+      ],
+    };
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({
+        detail: {
+          code: "speech_synthesis_failed",
+          error_category: "speech_synthesis_failed",
+          result_status: "completed_with_tts_error",
+          tts_generated: false,
+          transcript: "Only correct 10 minutes",
+          detected_language: "en",
+          detected_locale: "en-US",
+          response_language: "en",
+          assistant_text: completed.message,
+          response: completed,
+        },
+      }), {
+        status: 502,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+
+    const result = await sendVoice({ audio: new Blob(["wav"]) });
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({
+      ...completed,
+      transcript: "Only correct 10 minutes",
+      detected_language: "en",
+      detected_locale: "en-US",
+      audio_base64: "",
+      tts_unavailable: true,
+      tts_error_category: "speech_synthesis_failed",
+    });
+    expect(result.blocks).toEqual(completed.blocks);
+  });
+
+  it.each([
+    [
+      "generic server failure",
+      500,
+      { detail: { code: "server_error", assistant_text: "Do not recover" } },
+    ],
+    [
+      "ResourcePlus business failure",
+      502,
+      {
+        code: "resourceplus_unavailable",
+        detail: {
+          code: "resourceplus_unavailable",
+          error_category: "resourceplus_error",
+          assistant_text: "Do not recover",
+        },
+      },
+    ],
+    ["malformed response", 502, "not-json"],
+    [
+      "identity failure",
+      422,
+      { detail: { code: "invalid_identity", message: "internal" } },
+    ],
+    [
+      "incomplete TTS marker",
+      502,
+      {
+        detail: {
+          code: "speech_synthesis_failed",
+          assistant_text: "Do not recover without the explicit contract",
+        },
+      },
+    ],
+  ])("does not recover %s", async (_name, status, payload) => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        typeof payload === "string" ? payload : JSON.stringify(payload),
+        { status, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+
+    await expect(sendVoice({ audio: new Blob(["wav"]) })).rejects.toBeInstanceOf(Error);
+  });
 });

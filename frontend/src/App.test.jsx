@@ -171,6 +171,84 @@ describe("ResourcePlus demo UI", () => {
     expect(document.body.textContent).not.toContain("**");
   });
 
+  it("sends an explicit correction request from a less-hours action", () => {
+    const onActionSelect = vi.fn();
+    render(
+      <ChatMessage
+        message={{
+          role: "assistant",
+          text: "You have one less-hours entry eligible for correction.",
+          blocks: [
+            {
+              type: "table",
+              title: "Less-hours attendance",
+              columns: [
+                { key: "date", label: "Date" },
+                { key: "action", label: "Action" },
+              ],
+              rows: [{ date: "2026-09-10", action: "Correction candidate" }],
+            },
+            {
+              type: "actions",
+              title: "Available actions",
+              actions: [{
+                label: "Correct 2026-09-10",
+                value: "Correct my less hours on 2026-09-10",
+                style: "primary",
+              }],
+            },
+          ],
+        }}
+        onActionSelect={onActionSelect}
+        busy={false}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Correct 2026-09-10" }));
+    expect(onActionSelect).toHaveBeenCalledWith({
+      label: "Correct 2026-09-10",
+      value: "Correct my less hours on 2026-09-10",
+      style: "primary",
+    });
+    expect(screen.getByText("Correction candidate")).toBeTruthy();
+    expect(document.body.textContent).not.toContain("Eligible");
+  });
+
+  it("shows an action label while sending its opaque candidate value", async () => {
+    const label = "22 Sep · Family Circumstances · Early Departure";
+    const opaqueValue = "Select exceptional entry ce-6b829709ddeb";
+    sendChat
+      .mockResolvedValueOnce(response({
+        message: "Choose a cancellable request.",
+        blocks: [{
+          type: "actions",
+          title: "Select an entry",
+          actions: [{ label, value: opaqueValue, style: "secondary" }],
+        }],
+      }))
+      .mockResolvedValueOnce(response({
+        message: "Confirm cancellation.",
+        requires_confirmation: true,
+        confirmation_id: "confirmation-one",
+      }))
+      .mockResolvedValueOnce(response({ message: "Cancelled." }));
+
+    render(<App />);
+    await sendTypedMessage("Cancel my pending exceptional entries");
+    const candidateButton = await screen.findByRole("button", { name: label });
+    fireEvent.click(candidateButton);
+
+    await waitFor(() => expect(sendChat).toHaveBeenCalledTimes(2));
+    expect(sendChat.mock.calls[1][0].message).toBe(opaqueValue);
+    expect(screen.getAllByText(label).length).toBeGreaterThan(1);
+    expect(document.body.textContent).not.toContain("ce-6b829709ddeb");
+    expect(candidateButton.disabled).toBe(true);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(sendChat).toHaveBeenCalledTimes(3));
+    expect(candidateButton.disabled).toBe(true);
+  });
+
   it("keeps Arabic assistant Markdown RTL", () => {
     render(
       <ChatMessage
@@ -396,6 +474,149 @@ describe("ResourcePlus demo UI", () => {
     await holdAndRelease();
 
     await waitFor(() => expect(sendVoice).toHaveBeenCalledTimes(1));
+  });
+
+  it("renders a completed HTTP voice result when only TTS failed", async () => {
+    const transcript = "Only correct 10 minutes of my late arrival on 10 September";
+    sendVoice.mockResolvedValueOnce(
+      response({
+        message: "Confirm the 10-minute late-arrival correction.",
+        transcript,
+        detected_language: "en",
+        detected_locale: "en-US",
+        session_id: "tts-confirmation-session",
+        requires_confirmation: true,
+        confirmation_id: "tts-confirmation-id",
+        audio_base64: "",
+        tts_unavailable: true,
+        blocks: [
+          {
+            type: "table",
+            title: "Correction details",
+            columns: [{ key: "date", label: "Date" }],
+            rows: [{ date: "2026-09-10" }],
+          },
+          {
+            type: "key_value",
+            title: "Request scope",
+            items: [{ label: "Minutes", value: 10 }],
+          },
+          {
+            type: "stat_cards",
+            title: "Allowance",
+            items: [{ label: "Remaining", value: 90 }],
+          },
+          {
+            type: "actions",
+            title: "Available actions",
+            actions: [{ label: "Review correction", value: "review" }],
+          },
+          {
+            type: "confirmation",
+            title: "Confirmation required",
+            summary: "Confirm the correction.",
+          },
+          {
+            type: "notice",
+            title: "ResourcePlus",
+            message: "No request has been submitted yet.",
+            level: "info",
+          },
+        ],
+      }),
+    );
+    render(<App />);
+
+    await holdAndRelease();
+
+    expect(await screen.findByText(transcript)).toBeTruthy();
+    expect(screen.getByText("Confirm the 10-minute late-arrival correction.")).toBeTruthy();
+    expect(screen.getByText("Correction details")).toBeTruthy();
+    expect(screen.getByText("Request scope")).toBeTruthy();
+    expect(screen.getByText("Allowance")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Review correction" })).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "ResourcePlus" })).toBeTruthy();
+    expect(screen.getByText("Action requires confirmation")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Confirm" })).toBeTruthy();
+    expect(await screen.findByText(
+      "Voice audio is unavailable right now. The response is shown as text.",
+    )).toBeTruthy();
+    await waitFor(() => {
+      expect(sessionStorage.getItem("resourceplus.demo.session")).toBe(
+        "tts-confirmation-session",
+      );
+      expect(sessionStorage.getItem("resourceplus.demo.confirmation")).toBe(
+        "tts-confirmation-id",
+      );
+    });
+    expect(sendVoice).toHaveBeenCalledTimes(1);
+    expect(audioBase64ToUrl).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(sendChat).toHaveBeenCalledTimes(1));
+    expect(sendChat).toHaveBeenLastCalledWith({
+      message: "No",
+      sessionId: "tts-confirmation-session",
+      confirmationId: "tts-confirmation-id",
+    });
+    expect(sendVoice).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps an Arabic completed TTS-failure response visible and RTL", async () => {
+    const transcript = "اعرض طلبات الاستثناء لهذا الشهر";
+    const message = "هذه طلبات الاستثناء الخاصة بك.";
+    sendVoice.mockResolvedValueOnce(
+      response({
+        message,
+        transcript,
+        language: "ar",
+        detected_language: "ar",
+        detected_locale: "ar-SA",
+        session_id: "arabic-tts-session",
+        audio_base64: "",
+        tts_unavailable: true,
+        blocks: [{
+          type: "table",
+          title: "طلبات الاستثناء",
+          columns: [{ key: "status", label: "الحالة" }],
+          rows: [{ status: "معلّق" }],
+        }],
+      }),
+    );
+    render(<App />);
+
+    await holdAndRelease();
+
+    const assistantText = await screen.findByText(message);
+    expect(screen.getByText(transcript)).toBeTruthy();
+    expect(assistantText.closest(".message-bubble").dir).toBe("rtl");
+    expect(assistantText.closest(".message-bubble").lang).toBe("ar");
+    expect(screen.getByText("طلبات الاستثناء")).toBeTruthy();
+    expect(await screen.findByText(
+      "الصوت غير متاح حاليًا. تم عرض الرد كنص.",
+    )).toBeTruthy();
+    expect(sendVoice).toHaveBeenCalledTimes(1);
+    expect(audioBase64ToUrl).not.toHaveBeenCalled();
+  });
+
+  it("does not retry a finalized HTTP voice result after TTS failure", async () => {
+    sendVoice.mockResolvedValueOnce(
+      response({
+        message: "Your request has been submitted.",
+        transcript: "Yes",
+        session_id: "completed-action-session",
+        audio_base64: "",
+        tts_unavailable: true,
+      }),
+    );
+    render(<App />);
+
+    await holdAndRelease();
+
+    expect(await screen.findByText("Your request has been submitted.")).toBeTruthy();
+    expect(sendVoice).toHaveBeenCalledTimes(1);
+    expect(sendChat).not.toHaveBeenCalled();
+    expect(audioBase64ToUrl).not.toHaveBeenCalled();
   });
 
   it("does not POST an invalid retained WAV after a streaming failure", async () => {

@@ -246,7 +246,19 @@ async def voice_chat(
         reset_interaction_audit(audit_token)
         raise HTTPException(
             status_code=502,
-            detail={"code": "speech_synthesis_failed", "message": str(exc)},
+            detail={
+                "code": "speech_synthesis_failed",
+                "message": "The response is ready, but voice audio is unavailable.",
+                "error_category": "speech_synthesis_failed",
+                "result_status": "completed_with_tts_error",
+                "tts_generated": False,
+                "transcript": recognized.transcript,
+                "detected_language": recognized.detected_language,
+                "detected_locale": recognized.detected_locale,
+                "response_language": chat_response.language,
+                "assistant_text": chat_response.message,
+                "response": chat_response.model_dump(mode="json"),
+            },
         ) from exc
     except Exception as exc:
         _mark_voice_error("unknown_safe_category")
@@ -384,6 +396,7 @@ async def voice_stream(websocket: WebSocket) -> None:
                 safe_category="invalid_stream_state",
             ) from exc
         debug = metadata.get("debug") is True
+        progressive_events = metadata.get("progressive_events") is True
         audit, audit_token = start_interaction_audit(
             input_mode="voice",
             input_source="stt",
@@ -392,6 +405,8 @@ async def voice_stream(websocket: WebSocket) -> None:
         recognizer = StreamingSpeechRecognizer()
         await recognizer.start()
         await websocket.send_json({"type": "ready"})
+        if progressive_events:
+            await websocket.send_json({"type": "listening"})
 
         received_bytes = 0
         while True:
@@ -448,6 +463,17 @@ async def voice_stream(websocket: WebSocket) -> None:
             recognized = await recognizer.finish()
         completed = True
 
+        if progressive_events:
+            await websocket.send_json(
+                {
+                    "type": "transcript_final",
+                    "transcript": recognized.transcript,
+                    "detected_language": recognized.detected_language,
+                    "detected_locale": recognized.detected_locale,
+                }
+            )
+            await websocket.send_json({"type": "processing"})
+
         audit.user_text = recognized.transcript
         audit.raw_detected_locale = recognized.detected_locale
         audit.resolved_language = recognized.detected_language
@@ -472,6 +498,13 @@ async def voice_stream(websocket: WebSocket) -> None:
         audit.success = chat_response.success
         audit.result_status = "success" if chat_response.success else "failed"
         audit.confirmation_required = chat_response.requires_confirmation
+        if progressive_events:
+            await websocket.send_json(
+                {
+                    "type": "assistant_text",
+                    **chat_response.model_dump(mode="json"),
+                }
+            )
         speech_source = chat_response.speech_message
         if not speech_source:
             raise SpeechSynthesisError(
@@ -482,21 +515,54 @@ async def voice_stream(websocket: WebSocket) -> None:
         audit.tts_text = speech_text
         audit.tts_requested = True
         audit.tts_generated = False
-        with measure_stage("tts"):
-            spoken = await synthesize_speech(
-                speech_text,
-                language=chat_response.language,
+        try:
+            with measure_stage("tts"):
+                spoken = await synthesize_speech(
+                    speech_text,
+                    language=chat_response.language,
+                )
+            audit.tts_generated = True
+            audit.tts_locale = spoken.locale
+            audit.tts_voice = spoken.voice_name
+        except SpeechSynthesisError as exc:
+            category = _safe_error_category(exc)
+            _mark_voice_error(category)
+            audit.error_category = category
+            if not progressive_events:
+                await websocket.send_json(
+                    {
+                        "type": "error",
+                        "code": "speech_synthesis_failed",
+                        "message": "I understood you, but couldn't create a spoken reply.",
+                        "assistant_text": chat_response.message,
+                        "response": chat_response.model_dump(mode="json"),
+                    }
+                )
+                status_code = 502
+                _capture_voice_trace(audit)
+                await persist_audit(audit)
+                audit_persisted = True
+                await websocket.close(code=1011)
+                return
+            await websocket.send_json(
+                {
+                    "type": "error",
+                    "scope": "tts",
+                    "code": "speech_synthesis_failed",
+                    "message": "The text answer is ready, but spoken audio is unavailable.",
+                    "category": category,
+                }
             )
-        audit.tts_generated = True
-        audit.tts_locale = spoken.locale
-        audit.tts_voice = spoken.voice_name
+            spoken = None
         response = VoiceChatResponse(
             **chat_response.model_dump(),
             transcript=recognized.transcript,
             detected_language=recognized.detected_language,
             detected_locale=recognized.detected_locale,
-            audio_base64=base64.b64encode(spoken.data).decode("ascii"),
-            audio_mime_type=spoken.mime_type,
+            audio_base64=(
+                base64.b64encode(spoken.data).decode("ascii") if spoken else ""
+            ),
+            audio_mime_type=spoken.mime_type if spoken else "audio/wav",
         )
         response_payload = {"type": "final", **response.model_dump()}
         if debug:

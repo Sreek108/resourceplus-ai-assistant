@@ -25,8 +25,12 @@ class Settings(BaseSettings):
     rp_default_email: str = "saneesh.netsoftpro@gmail.com"
     rp_default_lang: int = Field(default=DEFAULT_RESOURCEPLUS_LANG, ge=1)
     rp_timeout_seconds: float = Field(default=20.0, gt=0)
+    resourceplus_timezone: str = "Asia/Riyadh"
     confirmation_ttl_seconds: int = Field(default=300, ge=30, le=1_800)
     session_ttl_seconds: int = Field(default=1_800, ge=300, le=86_400)
+    reference_data_cache_ttl_seconds: float = Field(default=300.0, ge=1, le=3_600)
+    reference_data_cache_max_entries: int = Field(default=32, ge=2, le=256)
+    deterministic_read_fast_paths: bool = True
     cors_allowed_origins: str = "http://127.0.0.1:5173,http://localhost:5173"
     uat_allowed_origins: str = ""
 
@@ -39,6 +43,8 @@ class Settings(BaseSettings):
     azure_speech_ar_locale: str = "ar-SA"
     azure_speech_en_voice: str = "en-US-AvaNeural"
     azure_speech_ar_voice: str = "ar-SA-ZariyahNeural"
+    azure_tts_timeout_seconds: float = Field(default=20.0, ge=1, le=60)
+    azure_tts_transient_retry: bool = True
 
     ai_audit_enabled: bool = False
     ai_audit_store_content: bool = False

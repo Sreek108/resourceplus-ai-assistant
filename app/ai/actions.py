@@ -11,8 +11,13 @@ from app.resourceplus.approvals import (
 )
 from app.resourceplus.attendance import (
     create_exceptional_entry,
+    get_attendance_summary,
     get_exception_reasons,
     get_missing_punch_suggestions,
+)
+from app.resourceplus.exceptional import (
+    cancel_exceptional_entry,
+    create_exceptional_entry_from_summary,
 )
 from app.resourceplus.leave import (
     book_day_type,
@@ -30,6 +35,8 @@ from app.resourceplus.missing_punch import (
     normalize_missing_punch_suggestions,
     parse_missing_punch_date,
 )
+from app.resourceplus.requests import get_exceptional_entry_requests
+from app.time_context import resourceplus_today
 
 
 @dataclass(frozen=True)
@@ -38,6 +45,24 @@ class ActionIntent:
     validated_arguments: dict[str, object]
     summary: str
     language: str
+
+
+@dataclass(frozen=True)
+class LessHoursDay:
+    attendance_date: date
+    day_type: str
+    check_in: str | None
+    check_out: str | None
+    worked_hours: str
+    less_hours: str
+    eligibility: str
+    raw: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class LessHoursInspection:
+    days: tuple[LessHoursDay, ...]
+    eligible_days: tuple[LessHoursDay, ...]
 
 
 class ActionResolutionRequired(Exception):
@@ -69,7 +94,17 @@ def _parse_resourceplus_date(value: object) -> date:
     if not isinstance(value, str):
         raise ValueError("ResourcePlus returned an invalid date.")
     normalized = value.strip()
-    for date_format in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
+    try:
+        return datetime.fromisoformat(normalized.replace("Z", "+00:00")).date()
+    except ValueError:
+        pass
+    for date_format in (
+        "%Y-%m-%d",
+        "%d/%m/%Y",
+        "%d-%m-%Y",
+        "%d/%m/%Y %H:%M",
+        "%Y-%m-%d %H:%M:%S",
+    ):
         try:
             return datetime.strptime(normalized, date_format).date()
         except ValueError:
@@ -135,6 +170,152 @@ def _field(item: dict[str, Any], *names: str) -> object:
     return None
 
 
+def _attendance_rows(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        return [row for row in payload if isinstance(row, dict)]
+    if not isinstance(payload, dict):
+        raise ValueError("ResourcePlus returned an unexpected attendance response.")
+    normalized = {_normalized_key(key): value for key, value in payload.items()}
+    for name in ("Days", "Attendance", "AttendanceDetails", "Details"):
+        value = normalized.get(_normalized_key(name))
+        if isinstance(value, list):
+            return [row for row in value if isinstance(row, dict)]
+    return []
+
+
+def _duration_minutes(value: object) -> int:
+    if not isinstance(value, str):
+        return 0
+    match = re.fullmatch(r"\s*(\d{1,3}):(\d{2})\s*", value)
+    if match is None or int(match.group(2)) >= 60:
+        return 0
+    return int(match.group(1)) * 60 + int(match.group(2))
+
+
+def _punch_value(row: dict[str, Any], *names: str) -> str | None:
+    value = _field(row, *names)
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if not normalized or normalized.casefold() in {"-", "--", "n/a", "null", "00:00"}:
+        return None
+    return normalized
+
+
+def _less_hours_eligibility(
+    *,
+    day_type: str,
+    less_minutes: int,
+    has_punch: bool,
+) -> str:
+    normalized = _normalized_key(day_type)
+    if any(term in normalized for term in ("weekend", "weekoff", "weekendday")):
+        return "week_end"
+    if "holiday" in normalized:
+        return "holiday"
+    if "businesstravel" in normalized:
+        return "business_travel"
+    if "leave" in normalized:
+        return "leave"
+    if "absent" in normalized or not has_punch:
+        return "no_punches"
+    if less_minutes <= 0:
+        return "no_missing_hours"
+    return "eligible"
+
+
+async def inspect_less_hours_period(
+    date_from: date | str,
+    date_to: date | str,
+    *,
+    lang: int,
+) -> LessHoursInspection:
+    start = _parse_resourceplus_date(str(date_from)) if not isinstance(date_from, date) else date_from
+    end = _parse_resourceplus_date(str(date_to)) if not isinstance(date_to, date) else date_to
+    if start > end:
+        raise ValueError("date_from must be on or before date_to.")
+    rows = _attendance_rows(
+        await get_attendance_summary(start.isoformat(), end.isoformat(), lang=lang)
+    )
+    days: list[LessHoursDay] = []
+    for row in rows:
+        raw_date = _field(row, "AttDate", "attendanceDate", "date")
+        try:
+            attendance_date = _parse_resourceplus_date(raw_date)
+        except ValueError:
+            continue
+        if not start <= attendance_date <= end:
+            continue
+        day_type_value = _field(row, "DayType", "dayType", "Status", "attendanceStatus")
+        day_type = str(day_type_value).strip() if day_type_value not in (None, "") else "—"
+        check_in = _punch_value(row, "IN", "InTime", "PunchIn", "FirstIn", "checkIn")
+        check_out = _punch_value(row, "OUT", "OutTime", "PunchOut", "LastOut", "checkOut")
+        worked = _field(row, "NetHrs", "WorkedHours", "Worked")
+        less = _field(row, "LessHrs", "Shortfall")
+        worked_hours = str(worked).strip() if worked not in (None, "") else "00:00"
+        less_hours = str(less).strip() if less not in (None, "") else "00:00"
+        eligibility = _less_hours_eligibility(
+            day_type=day_type,
+            less_minutes=_duration_minutes(less_hours),
+            has_punch=check_in is not None or check_out is not None,
+        )
+        days.append(
+            LessHoursDay(
+                attendance_date=attendance_date,
+                day_type=day_type,
+                check_in=check_in,
+                check_out=check_out,
+                worked_hours=worked_hours,
+                less_hours=less_hours,
+                eligibility=eligibility,
+                raw=dict(row),
+            )
+        )
+    return LessHoursInspection(
+        days=tuple(days),
+        eligible_days=tuple(day for day in days if day.eligibility == "eligible"),
+    )
+
+
+def _exceptional_request_rows(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        return [row for row in payload if isinstance(row, dict)]
+    if isinstance(payload, dict):
+        for key in ("entries", "requests", "data", "exceptionalEntries"):
+            value = _field(payload, key)
+            if isinstance(value, list):
+                return [row for row in value if isinstance(row, dict)]
+    return []
+
+
+def _is_cancellable_exception(row: dict[str, Any]) -> bool:
+    cancellable = _field(row, "isCancellable", "canCancel")
+    if isinstance(cancellable, bool):
+        return cancellable
+    status = _field(row, "status", "requestStatus")
+    if not isinstance(status, str):
+        return False
+    return _normalized_key(status) in {
+        "notapproved",
+        "pending",
+        "pendingapproval",
+        "pendingforapproval",
+        "submitted",
+    }
+
+
+async def find_pending_exceptional_entries(
+    date_from: date | str,
+    date_to: date | str,
+    *,
+    lang: int,
+) -> list[dict[str, Any]]:
+    rows = _exceptional_request_rows(
+        await get_exceptional_entry_requests(date_from, date_to, lang=lang)
+    )
+    return [row for row in rows if _is_cancellable_exception(row)]
+
+
 def _format_time(value: datetime) -> str:
     hour = value.hour % 12 or 12
     suffix = "AM" if value.hour < 12 else "PM"
@@ -143,6 +324,107 @@ def _format_time(value: datetime) -> str:
 
 def _format_date(value: date) -> str:
     return value.strftime("%d %B %Y")
+
+
+def exceptional_entry_display(row: dict[str, Any]) -> str:
+    """Return a safe, employee-facing description without exposing its ID."""
+
+    attributes = exceptional_entry_attributes(row)
+    raw_date = attributes["date"]
+    try:
+        displayed_date = _format_date(_parse_resourceplus_date(raw_date))
+    except ValueError:
+        displayed_date = str(raw_date).strip() if raw_date not in (None, "") else "the selected date"
+    reason = attributes["reason"]
+    status = attributes["status"]
+    details = [displayed_date]
+    entry_type = attributes["type"]
+    if entry_type not in (None, ""):
+        details.append(str(entry_type).strip())
+    if reason not in (None, ""):
+        details.append(str(reason).strip())
+    if status not in (None, ""):
+        details.append(str(status).strip())
+    return " — ".join(details)
+
+
+def exceptional_entry_attributes(row: dict[str, Any]) -> dict[str, str]:
+    """Return only safe, user-facing candidate attributes from an RP row."""
+
+    raw_date = _field(
+        row,
+        "entryTime",
+        "attDate",
+        "attendanceDate",
+        "date",
+        "requestDate",
+    )
+    try:
+        displayed_date = _parse_resourceplus_date(raw_date).isoformat()
+    except ValueError:
+        displayed_date = str(raw_date).strip() if raw_date not in (None, "") else ""
+    raw_type = _field(row, "entryTypeName", "type", "entryType")
+    normalized_type = str(raw_type).strip() if raw_type not in (None, "") else ""
+    entry_type = (
+        "Late Arrival"
+        if normalized_type == "1"
+        else "Early Departure"
+        if normalized_type == "2"
+        else normalized_type
+    )
+    return {
+        "date": displayed_date,
+        "type": entry_type,
+        "reason": str(_field(row, "reason", "reasonName", "description") or "").strip(),
+        "status": str(_field(row, "status", "requestStatus") or "").strip(),
+    }
+
+
+def prepare_cancel_exceptional_candidate(
+    row: dict[str, Any],
+    *,
+    response_language: str,
+) -> ActionIntent:
+    """Prepare cancellation from a candidate already fetched for this session."""
+
+    if not _is_cancellable_exception(row):
+        raise ValueError("The selected exceptional entry is no longer cancellable.")
+    exceptional_id = _field(row, "exceptionalID", "exceptionID", "id")
+    if exceptional_id in (None, ""):
+        raise ValueError("ResourcePlus returned a cancellable entry without an ID.")
+    display = exceptional_entry_display(row)
+    if response_language == "ar":
+        attributes = exceptional_entry_attributes(row)
+        entry_type = {
+            "Late Arrival": "وصول متأخر",
+            "Early Departure": "خروج مبكر",
+        }.get(attributes["type"], attributes["type"])
+        status = {
+            "Not Approved": "غير موافق عليه",
+            "Approved": "موافق عليه",
+            "Rejected": "مرفوض",
+            "Pending": "معلّق",
+        }.get(attributes["status"], attributes["status"])
+        display = " — ".join(
+            value
+            for value in (
+                attributes["date"],
+                entry_type,
+                attributes["reason"],
+                status,
+            )
+            if value
+        )
+    internal = {
+        "exceptional_id": str(exceptional_id),
+        "display": display,
+    }
+    return ActionIntent(
+        "cancel_exceptional_entry",
+        internal,
+        _confirmation_summary("cancel_exceptional_entry", internal, response_language),
+        response_language,
+    )
 
 
 async def _live_exception_reasons(lang: int) -> list[tuple[str, str]]:
@@ -278,6 +560,52 @@ def _confirmation_summary(
             f"Reason: {values['reason_name']}. Submit this exceptional-entry request? "
             "Confirmation is required."
         )
+    if action_type == "create_exceptional_entry_from_summary":
+        side = values.get("entry_type")
+        side_text = (
+            "late IN only"
+            if side == 1
+            else "early OUT only"
+            if side == 2
+            else None
+        )
+        details = [f"Date: {values['att_date']}"]
+        if "minutes" in values:
+            details.append(f"Requested minutes: {values['minutes']}")
+        if side_text is not None:
+            details.append(f"Scope: {side_text}")
+        details.extend(
+            [
+                f"Reason: {values['reason_name']}",
+                f"Missing duration: {values['less_hours']}",
+            ]
+        )
+        if language == "ar":
+            arabic_side = (
+                "التأخر في الدخول فقط"
+                if side == 1
+                else "الخروج المبكر فقط"
+                if side == 2
+                else None
+            )
+            arabic_details = [
+                f"التاريخ: {values['att_date']}",
+                f"المدة الناقصة: {values['less_hours']}",
+                f"السبب: {values['reason_name']}",
+            ]
+            if arabic_side is not None:
+                arabic_details.append(f"النطاق: {arabic_side}")
+            if "minutes" in values:
+                arabic_details.append(f"الدقائق المطلوبة: {values['minutes']}")
+            return "تصحيح الساعات الناقصة:\n\n" + "\n".join(arabic_details) + "\n\nالتأكيد مطلوب قبل الإرسال."
+        return "Correct the missing hours with these details:\n\n" + "\n".join(details) + "\n\nConfirmation is required before submission."
+    if action_type == "cancel_exceptional_entry":
+        if language == "ar":
+            return f"إلغاء طلب الإدخال الاستثنائي: {values['display']}. التأكيد مطلوب."
+        return (
+            f"Cancel this exceptional-entry request: {values['display']}. "
+            "Confirmation is required."
+        )
     if action_type == "book_day_type":
         return (
             f"Submit {values['day_type_name']} from {values['date_from']} through "
@@ -338,7 +666,7 @@ async def _prepare_exceptional_entry(
             range_start = parse_missing_punch_date(raw_start)
             range_end = parse_missing_punch_date(raw_end)
         else:
-            range_end = date.today()
+            range_end = resourceplus_today()
             range_start = range_end.replace(day=1)
     if range_start > range_end:
         raise ValueError("The exceptional-entry date range is invalid.")
@@ -551,6 +879,230 @@ async def prepare_exceptional_entry_reason_follow_up(
         reason_id=reason_id,
         reason_name=selected_reason_name,
         remarks=reason_text.strip(),
+        response_language=response_language,
+    )
+
+
+def _less_hours_not_eligible_message(day: LessHoursDay, language: str) -> str:
+    if day.eligibility == "no_punches":
+        if language == "ar":
+            return (
+                "لا توجد لديك بصمات حضور لهذا اليوم، لذلك لا يمكن "
+                "تصحيحه كساعات ناقصة. يمكنني مساعدتك في طلب إجازة أو مهمة عمل بدلاً من ذلك."
+            )
+        return (
+            "You do not have attendance punches for that day, so it cannot "
+            "be corrected as a less-hours entry. I can help you apply for Leave "
+            "or Business Travel instead."
+        )
+    labels = {
+        "week_end": "a week end",
+        "holiday": "a holiday",
+        "leave": "leave",
+        "business_travel": "business travel",
+    }
+    if day.eligibility in labels:
+        return (
+            f"That day is recorded as {labels[day.eligibility]}, so "
+            "there are no missing hours to correct with an exceptional entry."
+        )
+    return "You have no missing hours to correct for that day."
+
+
+async def _prepare_less_hours_correction(
+    arguments: dict[str, Any],
+    *,
+    lang: int,
+    response_language: str,
+) -> ActionIntent:
+    try:
+        target_date = date.fromisoformat(str(arguments.get("target_date")))
+    except ValueError as exc:
+        raise ValueError("The correction date must use YYYY-MM-DD format.") from exc
+
+    entry_type = arguments.get("entry_type")
+    if entry_type is not None:
+        if isinstance(entry_type, bool):
+            raise ValueError("entry_type must be 1, 2, or omitted.")
+        try:
+            entry_type = int(entry_type)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("entry_type must be 1, 2, or omitted.") from exc
+        if entry_type not in {1, 2}:
+            raise ValueError("entry_type must be 1, 2, or omitted.")
+
+    minutes = arguments.get("minutes")
+    if minutes is not None:
+        if isinstance(minutes, bool):
+            raise ValueError("minutes must be a positive whole number or omitted.")
+        try:
+            minutes = int(minutes)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("minutes must be a positive whole number or omitted.") from exc
+        if minutes <= 0:
+            raise ValueError("minutes must be a positive whole number or omitted.")
+
+    inspection = await inspect_less_hours_period(target_date, target_date, lang=lang)
+    matching_days = [day for day in inspection.days if day.attendance_date == target_date]
+    if not matching_days:
+        raise ActionResolutionRequired(
+            "ResourcePlus returned no attendance row for that date.",
+            category="attendance_not_found",
+        )
+    selected = matching_days[0]
+    if selected.eligibility != "eligible":
+        raise ActionResolutionRequired(
+            _less_hours_not_eligible_message(selected, response_language),
+            category=selected.eligibility,
+        )
+
+    live_reasons = await _live_exception_reasons(lang)
+    reason_names = [name for _, name in live_reasons]
+    reason_name = arguments.get("reason_name")
+    if (
+        not isinstance(reason_name, str)
+        or not reason_name.strip()
+        or (
+            arguments.get("_user_message") is not None
+            and not _reason_was_supplied_in_user_message(
+                reason_name,
+                arguments.get("_user_message"),
+            )
+        )
+    ):
+        choices = "\n".join(f"- {name}" for name in reason_names)
+        question = (
+            "ما سبب التصحيح؟\n\n" if response_language == "ar" else "What was the reason?\n\n"
+        )
+        raise ActionResolutionRequired(
+            question + choices,
+            category="reason_required",
+            requires_clarification=True,
+            draft_context={
+                "date": target_date.isoformat(),
+                "less_hours": selected.less_hours,
+                **({"entry_type": str(entry_type)} if entry_type is not None else {}),
+                **({"minutes": str(minutes)} if minutes is not None else {}),
+            },
+            reason_options=reason_names,
+        )
+
+    match = deterministic_reason_match(reason_name, reason_names)
+    selected_reason_index = match.index
+    if selected_reason_index is None:
+        selected_reason_index = await match_live_reason(reason_name, reason_names)
+    if selected_reason_index is None:
+        raise ActionResolutionRequired(
+            "I couldn't confidently match that reason to one live ResourcePlus reason.",
+            category="reason_ambiguous",
+            requires_clarification=True,
+            reason_options=reason_names,
+        )
+    reason_id, selected_reason_name = live_reasons[selected_reason_index]
+    remarks = arguments.get("remarks")
+    if not isinstance(remarks, str) or not remarks.strip():
+        remarks = reason_name
+    internal: dict[str, object] = {
+        "att_date": target_date.isoformat(),
+        "reason_id": reason_id,
+        "reason_name": selected_reason_name,
+        "remarks": remarks.strip(),
+        "less_hours": selected.less_hours,
+    }
+    if entry_type is not None:
+        internal["entry_type"] = entry_type
+    if minutes is not None:
+        internal["minutes"] = minutes
+    return ActionIntent(
+        "create_exceptional_entry_from_summary",
+        internal,
+        _confirmation_summary(
+            "create_exceptional_entry_from_summary",
+            internal,
+            response_language,
+        ),
+        response_language,
+    )
+
+
+async def prepare_less_hours_reason_follow_up(
+    *,
+    target_date: str,
+    reason_text: str,
+    lang: int,
+    response_language: str,
+    entry_type: int | None = None,
+    minutes: int | None = None,
+) -> ActionIntent:
+    """Revalidate attendance and the live reason before preparing the write."""
+
+    arguments: dict[str, Any] = {
+        "target_date": target_date,
+        "reason_name": reason_text,
+        "remarks": reason_text,
+    }
+    if entry_type is not None:
+        arguments["entry_type"] = entry_type
+    if minutes is not None:
+        arguments["minutes"] = minutes
+    return await _prepare_less_hours_correction(
+        arguments,
+        lang=lang,
+        response_language=response_language,
+    )
+
+
+async def _prepare_cancel_exceptional_entry(
+    arguments: dict[str, Any],
+    *,
+    lang: int,
+    response_language: str,
+) -> ActionIntent:
+    try:
+        start = date.fromisoformat(str(arguments.get("date_from")))
+        end = date.fromisoformat(str(arguments.get("date_to") or start.isoformat()))
+    except ValueError as exc:
+        raise ValueError("Cancellation dates must use YYYY-MM-DD format.") from exc
+    if start > end:
+        raise ValueError("date_from must be on or before date_to.")
+    target_date_raw = arguments.get("target_date")
+    target_date = date.fromisoformat(str(target_date_raw)) if target_date_raw else None
+    rows = await find_pending_exceptional_entries(start, end, lang=lang)
+    if target_date is not None:
+        matching: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                row_date = _parse_resourceplus_date(
+                    _field(
+                        row,
+                        "entryTime",
+                        "attDate",
+                        "attendanceDate",
+                        "date",
+                        "requestDate",
+                    )
+                )
+            except ValueError:
+                continue
+            if row_date == target_date:
+                matching.append(row)
+        rows = matching
+    if not rows:
+        raise ActionResolutionRequired(
+            "You have no cancellable pending exceptional entry for that period.",
+            category="no_cancellable_exception",
+        )
+    if len(rows) > 1:
+        choices = "\n".join(f"- {exceptional_entry_display(row)}" for row in rows)
+        raise ActionResolutionRequired(
+            "I found more than one cancellable exceptional entry:\n\n"
+            + choices
+            + "\n\nWhich one should I cancel?",
+            category="multiple_cancellable_exceptions",
+            requires_clarification=True,
+        )
+    return prepare_cancel_exceptional_candidate(
+        rows[0],
         response_language=response_language,
     )
 
@@ -839,6 +1391,14 @@ async def prepare_write_action(
         return await _prepare_exceptional_entry(
             arguments, lang=lang, response_language=response_language
         )
+    if tool_name == "prepare_less_hours_correction":
+        return await _prepare_less_hours_correction(
+            arguments, lang=lang, response_language=response_language
+        )
+    if tool_name == "prepare_cancel_exceptional_entry":
+        return await _prepare_cancel_exceptional_entry(
+            arguments, lang=lang, response_language=response_language
+        )
     if tool_name == "prepare_book_day_type":
         return await _prepare_book_day_type(
             arguments, lang=lang, response_language=response_language
@@ -872,6 +1432,20 @@ async def execute_pending_action(action_type: str, arguments: dict[str, object])
             reason_id=str(arguments["reason_id"]),
             remarks=str(arguments["remarks"]),
         )
+    if action_type == "create_exceptional_entry_from_summary":
+        return await create_exceptional_entry_from_summary(
+            att_date=str(arguments["att_date"]),
+            reason_id=str(arguments["reason_id"]),
+            remarks=str(arguments["remarks"]),
+            entry_type=(
+                int(arguments["entry_type"])
+                if "entry_type" in arguments
+                else None
+            ),
+            minutes=int(arguments["minutes"]) if "minutes" in arguments else None,
+        )
+    if action_type == "cancel_exceptional_entry":
+        return await cancel_exceptional_entry(str(arguments["exceptional_id"]))
     if action_type == "book_day_type":
         return await book_day_type(
             date_from=str(arguments["date_from"]),

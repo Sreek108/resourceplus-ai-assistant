@@ -1,3 +1,5 @@
+from typing import Annotated, Literal
+
 from pydantic import BaseModel, Field, PrivateAttr, field_validator
 
 
@@ -23,7 +25,86 @@ class ReasonOption(BaseModel):
     value: str
 
 
+class BlockColumn(BaseModel):
+    key: str
+    label: str
+
+
+class BlockItem(BaseModel):
+    label: str
+    value: str | int | float | bool | None
+
+
+class BlockAction(BaseModel):
+    label: str
+    value: str
+    style: Literal["primary", "secondary", "danger"] = "secondary"
+
+
+class TableBlock(BaseModel):
+    type: Literal["table"] = "table"
+    title: str
+    columns: list[BlockColumn]
+    rows: list[dict[str, str | int | float | bool | None]]
+
+
+class KeyValueBlock(BaseModel):
+    type: Literal["key_value"] = "key_value"
+    title: str
+    items: list[BlockItem]
+
+
+class StatCardsBlock(BaseModel):
+    type: Literal["stat_cards"] = "stat_cards"
+    title: str
+    items: list[BlockItem]
+
+
+class ListBlock(BaseModel):
+    type: Literal["list"] = "list"
+    title: str
+    items: list[str]
+
+
+class ActionsBlock(BaseModel):
+    type: Literal["actions"] = "actions"
+    title: str
+    actions: list[BlockAction]
+
+
+class ConfirmationBlock(BaseModel):
+    type: Literal["confirmation"] = "confirmation"
+    title: str
+    summary: str
+    actions: list[BlockAction] = Field(
+        default_factory=lambda: [
+            BlockAction(label="Confirm", value="confirm", style="primary"),
+            BlockAction(label="Cancel", value="cancel", style="secondary"),
+        ]
+    )
+
+
+class NoticeBlock(BaseModel):
+    type: Literal["notice"] = "notice"
+    title: str
+    message: str
+    level: Literal["info", "success", "warning", "error"] = "info"
+
+
+ResponseBlock = Annotated[
+    TableBlock
+    | KeyValueBlock
+    | StatCardsBlock
+    | ListBlock
+    | ActionsBlock
+    | ConfirmationBlock
+    | NoticeBlock,
+    Field(discriminator="type"),
+]
+
+
 class ChatResponse(BaseModel):
+    response_schema_version: Literal[2] = 2
     success: bool
     message: str
     display_message: str | None = None
@@ -34,6 +115,7 @@ class ChatResponse(BaseModel):
     confirmation_id: str | None = None
     needs_reason: bool = False
     reason_options: list[ReasonOption] | None = None
+    blocks: list[ResponseBlock] = Field(default_factory=list)
     _speech_message: str | None = PrivateAttr(default=None)
 
     def model_post_init(self, __context: object) -> None:

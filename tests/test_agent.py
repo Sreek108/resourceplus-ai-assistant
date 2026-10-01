@@ -553,6 +553,83 @@ async def test_employee_data_follow_up_forces_fresh_read_tool(monkeypatch) -> No
 
 
 @pytest.mark.asyncio
+async def test_model_routed_attendance_tool_result_keeps_trusted_blocks(monkeypatch) -> None:
+    tool_call = SimpleNamespace(
+        output=[
+            SimpleNamespace(
+                type="function_call",
+                name="get_attendance_summary",
+                arguments='{"from_date":"2026-09-01","to_date":"2026-09-30"}',
+                call_id="voice-attendance",
+            )
+        ],
+        output_text="",
+    )
+    final = SimpleNamespace(
+        output=[],
+        output_text=(
+            '{"display_message":"### Attendance\\n\\n| Date | Status |\\n|---|---|",'
+            '"speech_message":"Your attendance is ready."}'
+        ),
+    )
+
+    class FakeResponses:
+        def __init__(self):
+            self.calls = []
+
+        async def create(self, **kwargs):
+            self.calls.append(kwargs)
+            return [tool_call, final][len(self.calls) - 1]
+
+    monkeypatch.setattr(
+        agent,
+        "get_settings",
+        lambda: SimpleNamespace(
+            openai_api_key="test",
+            openai_model="test-model",
+            deterministic_read_fast_paths=False,
+        ),
+    )
+    monkeypatch.setattr(
+        agent,
+        "AsyncOpenAI",
+        lambda api_key: SimpleNamespace(responses=FakeResponses()),
+    )
+
+    from app.ai import tools as tool_module
+
+    async def attendance(*args, **kwargs):
+        return {"Days": [{
+            "AttDate": "2026-09-30",
+            "DayType": "Regular",
+            "CheckIN": "09:00",
+            "CheckOut": "18:00",
+            "NetHrs": "09:00",
+            "LessHrs": "00:00",
+        }]}
+
+    monkeypatch.setattr(tool_module, "get_attendance_summary", attendance)
+
+    result = await agent.run_agent(
+        "Uh show my ... over this month",
+        lang=1,
+        session_id="model-attendance",
+        history=[],
+    )
+
+    table = next(block for block in result.blocks or [] if block.type == "table")
+    assert table.title == "Attendance"
+    assert table.rows == [{
+        "date": "2026-09-30",
+        "status": "Regular",
+        "in": "09:00",
+        "out": "18:00",
+        "worked": "09:00",
+        "shortfall": "00:00",
+    }]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("message", "history", "expected_language"),
     [

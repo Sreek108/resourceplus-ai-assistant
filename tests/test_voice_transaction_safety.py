@@ -1,4 +1,5 @@
 import json
+from datetime import date
 
 import pytest
 from fastapi.testclient import TestClient
@@ -16,6 +17,7 @@ from app.identity import (
 from app.main import app
 from app.speech import SpeechAudio, SpeechTranscript
 from app.services import chat as chat_service
+from app.services import fast_reads
 
 
 client = TestClient(app)
@@ -76,6 +78,47 @@ def _identity_fields() -> dict[str, str]:
 
 async def _spoken_audio(*args, **kwargs):
     return SpeechAudio(b"voice-response")
+
+
+def test_http_voice_buffer_transcript_uses_deterministic_balance(monkeypatch) -> None:
+    calls = []
+
+    async def transcribe(*args, **kwargs):
+        return SpeechTranscript(
+            "How much buffer time do I have?",
+            "en-US",
+            "en",
+        )
+
+    async def balance(target_date):
+        calls.append(target_date)
+        return {"hasPolicy": True, "limitType": 2, "remaining": 120}
+
+    async def forbidden_write(*args, **kwargs):
+        raise AssertionError("a voice balance read must never execute a write")
+
+    def no_model(*args, **kwargs):
+        raise AssertionError("an exact voice balance transcript must not call OpenAI")
+
+    monkeypatch.setattr(voice_module, "transcribe_audio", transcribe)
+    monkeypatch.setattr(voice_module, "synthesize_speech", _spoken_audio)
+    monkeypatch.setattr(fast_reads, "resourceplus_today", lambda: date(2026, 10, 1))
+    monkeypatch.setattr(fast_reads, "get_exceptional_entry_balance", balance)
+    monkeypatch.setattr(chat_service, "execute_pending_action", forbidden_write)
+    monkeypatch.setattr(__import__("app.ai.agent", fromlist=["AsyncOpenAI"]), "AsyncOpenAI", no_model)
+
+    response = client.post(
+        "/api/voice/chat",
+        files={"audio": ("buffer.wav", b"RIFFvoice", "audio/wav")},
+        data={"session_id": "voice-buffer", **_identity_fields()},
+    )
+    body = response.json()
+
+    assert response.status_code == 200
+    assert calls == ["2026-10-01"]
+    assert body["transcript"] == "How much buffer time do I have?"
+    assert body["message"] == "You have 120 minutes remaining."
+    assert body["tools_used"] == ["get_exceptional_entry_balance"]
 
 
 @pytest.mark.parametrize(

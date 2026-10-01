@@ -63,6 +63,7 @@ export default function App() {
   const reasonSelectionRef = useRef(false);
   const chatScrollRef = useRef(null);
   const audioUrlsRef = useRef(new Set());
+  const voiceProgressRef = useRef({ transcript: "", assistantId: "" });
   const debug = useMemo(
     () => new URLSearchParams(window.location.search).get("debug") === "true",
     [],
@@ -136,6 +137,7 @@ export default function App() {
     voiceStreamPromiseRef.current = null;
     voiceStreamErrorRef.current = null;
     pendingPcmRef.current = [];
+    voiceProgressRef.current = { transcript: "", assistantId: "" };
     void recorder?.cancel?.();
     stream?.cancel?.();
     if (streamPromise) {
@@ -161,12 +163,16 @@ export default function App() {
   }
 
   function assistantMessage(response, extras = {}) {
+    const structuredBlocks = Array.isArray(response.blocks) ? response.blocks : [];
+    const fullText = response.display_message || response.message;
+    const compactText = structuredBlocks.length && typeof fullText === "string"
+      ? fullText.split(/\n\n(?=\|)/, 1)[0]
+      : fullText;
     return {
       id: uniqueId(),
       role: "assistant",
       text:
-        response.display_message
-        || response.message
+        compactText
         || "I couldn’t complete that request. Please try again.",
       language:
         response.language
@@ -184,6 +190,8 @@ export default function App() {
             )
             .map(({ label, value }) => ({ label, value }))
         : [],
+      blocks: structuredBlocks,
+      actionsActive: structuredBlocks.some((block) => block?.type === "actions"),
       ...extras,
       debug: {
         detected_language: extras.detectedLanguage || response.language,
@@ -203,14 +211,16 @@ export default function App() {
         ...message,
         requiresConfirmation: false,
         reasonOptionsActive: false,
+        actionsActive: false,
       })),
       userMessage,
       assistant,
     ]);
   }
 
-  async function submitText(textOverride, confirmationOverride) {
+  async function submitText(textOverride, confirmationOverride, visibleTextOverride) {
     const text = (textOverride ?? input).trim();
+    const visibleText = (visibleTextOverride ?? text).trim();
     if (!text || busy) return false;
     setInput("");
     setError("");
@@ -219,13 +229,14 @@ export default function App() {
     const userMessage = {
       id: uniqueId(),
       role: "user",
-      text,
-      language: messageLanguage(text),
+      text: visibleText,
+      language: messageLanguage(visibleText),
     };
     setMessages((current) => [
       ...current.map((message) => ({
         ...message,
         reasonOptionsActive: false,
+        actionsActive: false,
       })),
       userMessage,
     ]);
@@ -248,6 +259,19 @@ export default function App() {
     } finally {
       setStatus("idle");
     }
+  }
+
+  async function submitAction(messageId, action) {
+    if (
+      busy
+      || !action
+      || typeof action.value !== "string"
+      || typeof action.label !== "string"
+    ) return false;
+    setMessages((current) => current.map((message) => (
+      message.id === messageId ? { ...message, actionsActive: false } : message
+    )));
+    return submitText(action.value, undefined, action.label);
   }
 
   async function submitReason(messageId, value) {
@@ -299,6 +323,7 @@ export default function App() {
     voiceAttemptRef.current = attempt;
     try {
       pendingPcmRef.current = [];
+      voiceProgressRef.current = { transcript: "", assistantId: "" };
       voiceStreamRef.current = null;
       voiceStreamErrorRef.current = null;
       voiceStreamPromiseRef.current = openVoiceStream({
@@ -306,6 +331,34 @@ export default function App() {
         ...DEMO_IDENTITY,
         confirmationId,
         debug,
+        onEvent(event) {
+          if (voiceAttemptRef.current !== attempt) return;
+          if (event.type === "transcript_final") {
+            voiceProgressRef.current.transcript = event.transcript?.trim() || "";
+          }
+          if (event.type === "processing") setStatus("processing");
+          if (event.type === "assistant_text" && !voiceProgressRef.current.assistantId) {
+            const transcript = voiceProgressRef.current.transcript;
+            if (!transcript) return;
+            const assistantId = uniqueId();
+            voiceProgressRef.current.assistantId = assistantId;
+            applySession(event);
+            appendTurn(
+              {
+                id: uniqueId(),
+                role: "user",
+                text: transcript,
+                language: event.language || messageLanguage(transcript),
+                voice: true,
+                detectedLanguage: event.language,
+              },
+              assistantMessage(event, { id: assistantId, voice: true }),
+            );
+          }
+          if (event.type === "error" && event.scope === "tts") {
+            setNotice(event.message || "The text answer is ready, but spoken audio is unavailable.");
+          }
+        },
       })
         .then((streamController) => {
           if (
@@ -417,6 +470,13 @@ export default function App() {
         });
       }
       applySession(response);
+      if (response.tts_unavailable) {
+        setNotice(
+          response.language === "ar"
+            ? "الصوت غير متاح حاليًا. تم عرض الرد كنص."
+            : "Voice audio is unavailable right now. The response is shown as text.",
+        );
+      }
 
       const transcript = response.transcript?.trim();
       if (!transcript) throw new Error("No speech was detected. Please try again.");
@@ -443,7 +503,17 @@ export default function App() {
         detectedLanguage: response.detected_language,
         detectedLocale: response.detected_locale,
       });
-      appendTurn(userMessage, assistant);
+      const progressiveAssistantId = voiceProgressRef.current.assistantId;
+      if (progressiveAssistantId) {
+        setMessages((current) => current.map((message) => (
+          message.id === progressiveAssistantId
+            ? { ...assistant, id: progressiveAssistantId }
+            : message
+        )));
+      } else {
+        appendTurn(userMessage, assistant);
+      }
+      voiceProgressRef.current = { transcript: "", assistantId: "" };
       if (audioUrl) {
         playbackStarted = await playAudio(audioUrl, { automatic: true });
       }
@@ -541,6 +611,7 @@ export default function App() {
                     onConfirm={() => submitText("Yes", confirmationId)}
                     onCancel={() => submitText("No", confirmationId)}
                     onReasonSelect={(value) => submitReason(message.id, value)}
+                    onActionSelect={(action) => submitAction(message.id, action)}
                     busy={busy}
                     debug={debug}
                   />

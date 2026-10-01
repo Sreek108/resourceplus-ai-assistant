@@ -39,6 +39,28 @@ class ExceptionalEntryDraft:
     reason_options: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class ConversationDraft:
+    """Short-lived semantic slots; this state can never execute a write itself."""
+
+    intent: str
+    slots: dict[str, str]
+    validated_slots: tuple[str, ...]
+    language: str
+    created_at: datetime
+    expires_at: datetime
+
+
+@dataclass(frozen=True)
+class TrustedResultContext:
+    """Non-executable provenance for the latest successful ResourcePlus result."""
+
+    message: str
+    tools_used: tuple[str, ...]
+    language: str
+    created_at: datetime
+
+
 @dataclass
 class _SessionState:
     session_id: str
@@ -46,6 +68,8 @@ class _SessionState:
     history: list[HistoryItem] = field(default_factory=list)
     pending_action: PendingAction | None = None
     exceptional_entry_draft: ExceptionalEntryDraft | None = None
+    conversation_draft: ConversationDraft | None = None
+    trusted_result: TrustedResultContext | None = None
     exceptional_entry_history_start: int | None = None
     expired_pending_language: str | None = None
     expired_pending_action_type: str | None = None
@@ -102,6 +126,31 @@ class SessionStore(Protocol):
         self,
         session_id: str,
     ) -> ExceptionalEntryDraft | None: ...
+
+    def save_conversation_draft(
+        self,
+        session_id: str,
+        *,
+        intent: str,
+        slots: dict[str, str],
+        validated_slots: tuple[str, ...] = (),
+        language: str,
+    ) -> ConversationDraft: ...
+
+    def get_conversation_draft(self, session_id: str) -> ConversationDraft | None: ...
+
+    def clear_conversation_draft(self, session_id: str) -> ConversationDraft | None: ...
+
+    def save_trusted_result(
+        self,
+        session_id: str,
+        *,
+        message: str,
+        tools_used: list[str] | tuple[str, ...],
+        language: str,
+    ) -> TrustedResultContext: ...
+
+    def get_trusted_result(self, session_id: str) -> TrustedResultContext | None: ...
 
     def get_expired_pending_language(self, session_id: str) -> str | None: ...
 
@@ -161,6 +210,26 @@ class InMemorySessionStore:
             created_at=draft.created_at,
             expires_at=draft.expires_at,
             reason_options=draft.reason_options,
+        )
+
+    @staticmethod
+    def _clone_conversation_draft(draft: ConversationDraft) -> ConversationDraft:
+        return ConversationDraft(
+            intent=draft.intent,
+            slots=deepcopy(draft.slots),
+            validated_slots=draft.validated_slots,
+            language=draft.language,
+            created_at=draft.created_at,
+            expires_at=draft.expires_at,
+        )
+
+    @staticmethod
+    def _clone_trusted_result(context: TrustedResultContext) -> TrustedResultContext:
+        return TrustedResultContext(
+            message=context.message,
+            tools_used=context.tools_used,
+            language=context.language,
+            created_at=context.created_at,
         )
 
     def _remove_stale_sessions(self, current: datetime) -> None:
@@ -235,6 +304,7 @@ class InMemorySessionStore:
             state = self._sessions[session_id]
             state.pending_action = action
             state.exceptional_entry_draft = None
+            state.conversation_draft = None
             state.exceptional_entry_history_start = None
             state.expired_pending_language = None
             state.expired_pending_action_type = None
@@ -280,6 +350,86 @@ class InMemorySessionStore:
             state.exceptional_entry_draft = draft
             state.updated_at = current
             return self._clone_draft(draft)
+
+    def save_conversation_draft(
+        self,
+        session_id: str,
+        *,
+        intent: str,
+        slots: dict[str, str],
+        validated_slots: tuple[str, ...] = (),
+        language: str,
+    ) -> ConversationDraft:
+        if not intent.strip() or language not in {"en", "ar"}:
+            raise ValueError("Conversation draft intent and language are required.")
+        with self._lock:
+            self.ensure_session(session_id)
+            current = self._now()
+            draft = ConversationDraft(
+                intent=intent,
+                slots=deepcopy(slots),
+                validated_slots=tuple(dict.fromkeys(validated_slots)),
+                language=language,
+                created_at=current,
+                expires_at=current + self.confirmation_ttl,
+            )
+            state = self._sessions[session_id]
+            state.conversation_draft = draft
+            state.updated_at = current
+            return self._clone_conversation_draft(draft)
+
+    def get_conversation_draft(self, session_id: str) -> ConversationDraft | None:
+        with self._lock:
+            state = self._owned_state(session_id)
+            if state is None or state.conversation_draft is None:
+                return None
+            current = self._now()
+            if current >= state.conversation_draft.expires_at:
+                state.conversation_draft = None
+                state.updated_at = current
+                return None
+            return self._clone_conversation_draft(state.conversation_draft)
+
+    def clear_conversation_draft(self, session_id: str) -> ConversationDraft | None:
+        with self._lock:
+            state = self._owned_state(session_id)
+            if state is None or state.conversation_draft is None:
+                return None
+            draft = self._clone_conversation_draft(state.conversation_draft)
+            state.conversation_draft = None
+            state.updated_at = self._now()
+            return draft
+
+    def save_trusted_result(
+        self,
+        session_id: str,
+        *,
+        message: str,
+        tools_used: list[str] | tuple[str, ...],
+        language: str,
+    ) -> TrustedResultContext:
+        if not message.strip() or not tools_used or language not in {"en", "ar"}:
+            raise ValueError("Trusted result provenance is incomplete.")
+        with self._lock:
+            self.ensure_session(session_id)
+            current = self._now()
+            context = TrustedResultContext(
+                message=message.strip(),
+                tools_used=tuple(dict.fromkeys(tools_used)),
+                language=language,
+                created_at=current,
+            )
+            state = self._sessions[session_id]
+            state.trusted_result = context
+            state.updated_at = current
+            return self._clone_trusted_result(context)
+
+    def get_trusted_result(self, session_id: str) -> TrustedResultContext | None:
+        with self._lock:
+            state = self._owned_state(session_id)
+            if state is None or state.trusted_result is None:
+                return None
+            return self._clone_trusted_result(state.trusted_result)
 
     def get_exceptional_entry_draft(
         self,

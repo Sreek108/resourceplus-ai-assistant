@@ -124,7 +124,8 @@ The first WebSocket frame must be a text frame containing a JSON object:
   "instance": "Universal",
   "confirmation_id": null,
   "trace_id": "voice-demo-001",
-  "debug": false
+  "debug": false,
+  "progressive_events": true
 }
 ```
 
@@ -144,6 +145,8 @@ Fields:
   the two validated values must match.
 - `debug` is optional. Only the literal JSON value `true` adds diagnostics to the
   final response.
+- `progressive_events` is optional. When `true`, the server adds progress events.
+  When omitted, the established READY/binary PCM/END/FINAL contract is unchanged.
 
 There are no START fields for encoding, channels, bit depth, or endianness.
 
@@ -240,8 +243,12 @@ The two audio directions deliberately use different wire representations:
 The current synthesized output is RIFF/WAV, 24 kHz, 16-bit, mono PCM. The frontend
 still uses the returned `audio_mime_type` rather than hardcoding the MIME type.
 
-There are currently no partial transcript events, incremental AI text events, or
-binary TTS streaming frames.
+With `progressive_events: true`, the server may additionally emit `listening`,
+`transcript_final`, `processing`, and `assistant_text`. The text event is sent before
+TTS, so visual output is not blocked by synthesis. A TTS-only failure emits an `error`
+with `scope: "tts"`, followed by `final` with the valid text and an empty
+`audio_base64`. It does not retry or repeat any ResourcePlus operation. Progressive
+partial STT and binary TTS streaming are intentionally deferred.
 
 If START contains `"debug": true`, the final object additionally contains:
 
@@ -284,8 +291,8 @@ Currently implemented error codes:
 - `voice_processing_failed`
 
 Invalid trace-header validation or a disallowed browser origin can close the socket
-with WebSocket code `1008` without sending a JSON error. The server emits no other
-JSON message types.
+with WebSocket code `1008` without sending a JSON error. Legacy clients that omit
+`progressive_events` receive no additional progress event types.
 
 ### Complete streaming example
 
@@ -356,6 +363,13 @@ responses return `requires_confirmation=true` and a `confirmation_id`. A later
 natural affirmative or negative utterance is interpreted conversationally; it is
 not limited to a hardcoded Arabic phrase list. A confirmed write executes only the
 already-stored arguments.
+
+This includes ResourcePlus v2 less-hours FromSummary and exceptional-entry
+cancellation. Attendance eligibility, live reasons, optional side/minutes rules,
+and cancellation candidate resolution are identical to text chat. ResourcePlus is
+the sole auto-approval authority. With progressive events enabled, `assistant_text`
+can show the returned message/warning before TTS completes; a TTS-only failure never
+retries the HR write.
 
 The frontend-supplied `email` + `instance` pair is demo/UAT identity transport only.
 It is not production authentication. Production must replace it with identity derived
