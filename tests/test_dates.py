@@ -44,9 +44,27 @@ def test_this_month_runs_from_first_through_today() -> None:
     assert resolved.to_date == TODAY
 
 
-def test_arabic_date_phrases_are_not_an_application_command_map() -> None:
-    resolved = resolve_relative_date_range("اعرض حضوري اليوم", today=TODAY)
-    assert resolved is None
+def test_previous_month_is_complete_calendar_month() -> None:
+    resolved = resolve_relative_date_range("Previous month", today=date(2026, 10, 1))
+    assert resolved is not None
+    assert resolved.label == "previous_month"
+    assert resolved.from_date == date(2026, 9, 1)
+    assert resolved.to_date == date(2026, 9, 30)
+
+
+@pytest.mark.parametrize(
+    ("message", "expected_start"),
+    [
+        ("اعرض حضوري اليوم", TODAY),
+        ("اعرض حضوري هذا الأسبوع", date(2026, 9, 14)),
+        ("اعرض حضوري هذا الشهر", date(2026, 9, 1)),
+    ],
+)
+def test_supported_arabic_relative_period_cues(message, expected_start) -> None:
+    resolved = resolve_relative_date_range(message, today=TODAY)
+    assert resolved is not None
+    assert resolved.from_date == expected_start
+    assert resolved.to_date == TODAY
 
 
 @pytest.mark.asyncio

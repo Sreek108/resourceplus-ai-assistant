@@ -20,10 +20,6 @@ from app.resourceplus.leave import (
 EXCEPTIONAL_ENTRY_REQUESTS_ROUTE = "api/AI/ExceptionalEntries"
 logger = logging.getLogger(__name__)
 
-# TODO: Do not implement ExceptionalEntries/Cancel until the ResourcePlus backend
-# team provides its request-body contract.
-
-
 class ResourcePlusRequestStatusError(ResourcePlusError):
     """A request-status sub-call failed; the public message stays endpoint-neutral."""
 

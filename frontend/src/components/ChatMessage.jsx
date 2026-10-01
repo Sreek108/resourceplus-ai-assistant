@@ -3,6 +3,7 @@ import { messageDirection, messageLanguage } from "../lib/language";
 import ConfirmationCard from "./ConfirmationCard";
 import { SpeakerIcon } from "./Icons";
 import ReasonOptions from "./ReasonOptions";
+import ResponseBlocks from "./ResponseBlocks";
 
 export default function ChatMessage({
   message,
@@ -10,6 +11,7 @@ export default function ChatMessage({
   onConfirm,
   onCancel,
   onReasonSelect,
+  onActionSelect,
   busy,
   debug,
 }) {
@@ -49,6 +51,13 @@ export default function ChatMessage({
             </button>
           )}
         </div>
+        {assistant && (
+          <ResponseBlocks
+            blocks={message.needsReason ? message.blocks?.filter((block) => block.type !== "actions") : message.blocks}
+            onAction={onActionSelect}
+            actionsDisabled={busy || message.actionsActive === false}
+          />
+        )}
         {assistant && message.requiresConfirmation && (
           <ConfirmationCard
             onConfirm={onConfirm}

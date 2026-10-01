@@ -34,6 +34,11 @@ SAFE_ERROR_CATEGORIES = frozenset(
         "azure_canceled",
         "speech_recognition_failed",
         "speech_synthesis_failed",
+        "timeout",
+        "cancelled",
+        "network",
+        "auth_config",
+        "service_unavailable",
         "voice_unavailable",
         "invalid_stream_state",
         "stream_finalize_timeout",
@@ -66,6 +71,7 @@ SAFE_ACTION_STATES = frozenset(
 SAFE_ACTION_RESULTS = frozenset(
     {
         "submitted_for_approval",
+        "auto_approved",
         "cancelled",
         "approved",
         "updated",
@@ -77,6 +83,8 @@ SAFE_ACTION_TYPES = frozenset(
     {
         "book_day_type",
         "create_exceptional_entry",
+        "create_exceptional_entry_from_summary",
+        "cancel_exceptional_entry",
         "cancel_day_type_request",
         "approve_supervisor_request",
         "approve_all_requests",

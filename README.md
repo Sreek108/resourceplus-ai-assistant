@@ -262,6 +262,9 @@ access must follow ResourcePlus privacy and security policy.
 See [Latency and observability](docs/LATENCY_AND_OBSERVABILITY.md) for metrics,
 rollback notes, and the optimization history.
 
+See [Chat API v2](docs/CHAT_API_V2.md) for text streaming, structured response
+blocks, grounding, date defaults, identity requirements, and confirmation behavior.
+
 ## Production observability configuration
 
 Set safe release metadata in each deployment:
@@ -290,16 +293,18 @@ privacy/PDPL rules, retention, and multi-instance deployment guidance.
 
 ## ResourcePlus integrations
 
-Read operations include employee profile, home/leave balances, attendance, request
-status, manager approvals, and notifications. Confirmed write operations include
-exceptional entries, day-type booking/cancellation, supervisor approvals, and
-notification read status. There are no public write-debug endpoints, and automated
-tests mock all ResourcePlus writes.
+Read operations include employee profile, home/leave balances, attendance,
+exceptional-entry allowance, request status, manager approvals, and notifications.
+Confirmed write operations include FromSummary less-hours correction, legacy
+exact-time exceptional entries, exceptional-entry cancellation, day-type
+booking/cancellation, supervisor approvals, and notification read status. There are
+no public write-debug endpoints, and automated tests mock all ResourcePlus writes.
 
-The exceptional-entry contract is documented in
-[Exceptional-entry flow](docs/EXCEPTIONAL_ENTRY_FLOW.md):
-`MissingPunchSuggestions` -> `ExceptionalEntries/Reasons` -> immutable
-`PendingAction` confirmation -> `ExceptionalEntries/Request`.
+The two exceptional-entry contracts are documented in
+[Exceptional-entry flows](docs/EXCEPTIONAL_ENTRY_FLOW.md). Normal less-hours uses
+`AttendanceSummary` -> live reasons -> immutable confirmation -> `FromSummary`.
+Explicit missing-punch/exact-time cases retain `MissingPunchSuggestions` ->
+`ExceptionalEntries/Request`. ResourcePlus, not the AI, owns auto approval.
 
 ## Current POC limitations
 

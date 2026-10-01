@@ -70,6 +70,20 @@ be consumed.
 Rollback: revert the service-level gate only if confirmation state is redesigned.
 Never restore classification for sessions without a pending action.
 
+### Phase 5 — deterministic reads and progressive delivery
+
+High-confidence profile, attendance, missing-punch, notification, day-type, request,
+and supervisor-approval reads now bypass the multi-round model/tool loop. The backend
+selects the ResourcePlus read, performs independent combined reads concurrently, and
+builds trusted response blocks deterministically. Ambiguous turns still use the model.
+Day types and exceptional-entry reasons have a bounded, instance-scoped TTL cache for
+read display and slot resolution; write preparation still fetches fresh data.
+
+`POST /api/chat/stream` records first-status, first-text, and total histograms without
+PII labels. Progressive WebSocket clients receive final transcript and assistant text
+before TTS. TTS has a bounded transient-only retry and safe cancellation categories;
+its failure cannot cause another ResourcePlus write.
+
 ## Safe conversation audit
 
 When explicitly enabled, one SQLite row records safe per-interaction diagnostics.

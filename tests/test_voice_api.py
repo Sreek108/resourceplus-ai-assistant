@@ -8,7 +8,12 @@ from app.api import voice as voice_module
 from app.main import app
 from app.models.schemas import ChatResponse
 from app.services import chat as chat_service
-from app.speech import SpeechAudio, SpeechInputError, SpeechTranscript
+from app.speech import (
+    SpeechAudio,
+    SpeechInputError,
+    SpeechSynthesisError,
+    SpeechTranscript,
+)
 
 
 client = TestClient(app)
@@ -119,6 +124,117 @@ def test_voice_chat_preserves_pending_confirmation_fields(monkeypatch) -> None:
 
     assert response.json()["requires_confirmation"] is True
     assert response.json()["confirmation_id"] == "existing-confirmation"
+
+
+def test_voice_chat_tts_failure_exposes_completed_visual_response(monkeypatch) -> None:
+    async def transcribe(*args, **kwargs):
+        return SpeechTranscript(
+            "Only correct 10 minutes of my late arrival on 10 September",
+            "en-US",
+            "en",
+        )
+
+    async def process(request, *, detected_language):
+        return ChatResponse(
+            success=True,
+            message="Confirm the 10-minute late-arrival correction.",
+            language=detected_language,
+            session_id="tts-confirmation-session",
+            requires_confirmation=True,
+            confirmation_id="tts-confirmation-id",
+            blocks=[
+                {
+                    "type": "table",
+                    "title": "Correction",
+                    "columns": [{"key": "date", "label": "Date"}],
+                    "rows": [{"date": "2026-09-10"}],
+                },
+                {
+                    "type": "actions",
+                    "title": "Available actions",
+                    "actions": [{"label": "Review", "value": "review"}],
+                },
+                {
+                    "type": "confirmation",
+                    "title": "Confirmation required",
+                    "summary": "Confirm the correction.",
+                },
+            ],
+        ).set_speech_message("Please confirm the correction.")
+
+    async def synthesize(*args, **kwargs):
+        raise SpeechSynthesisError(
+            "provider detail must not be exposed",
+            safe_category="service_unavailable",
+        )
+
+    monkeypatch.setattr(voice_module, "transcribe_audio", transcribe)
+    monkeypatch.setattr(voice_module, "process_chat", process)
+    monkeypatch.setattr(voice_module, "synthesize_speech", synthesize)
+
+    response = client.post(
+        "/api/voice/chat",
+        files={"audio": ("utterance.wav", b"RIFFinput", "audio/wav")},
+    )
+
+    assert response.status_code == 502
+    detail = response.json()["detail"]
+    assert detail["code"] == "speech_synthesis_failed"
+    assert detail["error_category"] == "speech_synthesis_failed"
+    assert detail["result_status"] == "completed_with_tts_error"
+    assert detail["tts_generated"] is False
+    assert detail["transcript"].startswith("Only correct 10 minutes")
+    assert detail["detected_language"] == "en"
+    assert detail["detected_locale"] == "en-US"
+    assert detail["response_language"] == "en"
+    assert detail["assistant_text"] == detail["response"]["message"]
+    assert detail["response"]["session_id"] == "tts-confirmation-session"
+    assert detail["response"]["requires_confirmation"] is True
+    assert detail["response"]["confirmation_id"] == "tts-confirmation-id"
+    assert [block["type"] for block in detail["response"]["blocks"]] == [
+        "table",
+        "actions",
+        "confirmation",
+    ]
+    assert "provider detail" not in response.text
+
+
+def test_post_result_tts_failure_does_not_repeat_completed_action(monkeypatch) -> None:
+    completed_actions = []
+
+    async def transcribe(*args, **kwargs):
+        return SpeechTranscript("Yes", "en-US", "en")
+
+    async def process(request, *, detected_language):
+        completed_actions.append(request.confirmation_id)
+        return ChatResponse(
+            success=True,
+            message="Your request has been submitted.",
+            language=detected_language,
+            session_id="completed-action-session",
+        ).set_speech_message("Your request has been submitted.")
+
+    async def synthesize(*args, **kwargs):
+        raise SpeechSynthesisError("temporary", safe_category="service_unavailable")
+
+    monkeypatch.setattr(voice_module, "transcribe_audio", transcribe)
+    monkeypatch.setattr(voice_module, "process_chat", process)
+    monkeypatch.setattr(voice_module, "synthesize_speech", synthesize)
+
+    response = client.post(
+        "/api/voice/chat",
+        files={"audio": ("utterance.wav", b"RIFFinput", "audio/wav")},
+        data={
+            "session_id": "completed-action-session",
+            "confirmation_id": "stored-confirmation",
+        },
+    )
+
+    assert response.status_code == 502
+    assert response.json()["detail"]["response"]["message"] == (
+        "Your request has been submitted."
+    )
+    assert completed_actions == ["stored-confirmation"]
 
 
 @pytest.mark.parametrize(

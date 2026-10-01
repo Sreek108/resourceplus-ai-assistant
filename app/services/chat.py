@@ -13,6 +13,7 @@ from app.ai.attendance_intent import (
     late_arrival_unavailable_message,
 )
 from app.ai.reason_matcher import deterministic_reason_match
+from app.ai.conversation import continue_conversation, is_less_hours_request
 from app.ai.agent import (
     AgentResult,
     OpenAIServiceError,
@@ -26,6 +27,7 @@ from app.ai.sessions import (
     PendingActionMismatch,
     SessionIdentityMismatch,
     SessionStore,
+    TrustedResultContext,
     session_store,
 )
 from app.audit import record_action_state, record_safe_error, record_tool_usage
@@ -37,8 +39,15 @@ from app.identity import (
     resolve_request_identity,
 )
 from app.models.schemas import ChatRequest, ChatResponse
+from app.services.fast_reads import is_noisy_balance_reference, try_fast_read
+from app.services.response_blocks import (
+    confirmation_block,
+    exceptional_submission_blocks,
+    reason_actions,
+)
 from app.resourceplus import ResourcePlusError
 from app.speech.language import count_script_letters
+from app.time_context import resourceplus_today
 
 
 UNAMBIGUOUS_ENGLISH_CONFIRMATIONS = {
@@ -58,6 +67,8 @@ UNAMBIGUOUS_ENGLISH_REJECTIONS = {
     "do not do it",
     "stop",
 }
+UNAMBIGUOUS_ARABIC_CONFIRMATIONS = {"نعم", "أجل", "اجل"}
+UNAMBIGUOUS_ARABIC_REJECTIONS = {"لا"}
 MIN_EXPLICIT_LANGUAGE_SWITCH_LETTERS = 4
 CONFIRMATION_MESSAGES = {
     "cancelled": {
@@ -145,12 +156,71 @@ SUPPORTED_ARABIC_HR_TERMS = (
     "\u0631\u0627\u062a\u0628",  # salary
 )
 
+_TRUST_RETRACTION = re.compile(
+    r"\b(?:was(?:n't|\s+not)\s+supported|not\s+supported|unsupported|incorrect|wrong|"
+    r"not\s+accurate|mistake|fabricated|made\s+up|cannot\s+verify|can't\s+verify)\b",
+    re.IGNORECASE,
+)
+_TRUST_REFERENCE = re.compile(
+    r"\b(?:earlier|previous|prior|that\s+(?:figure|value|number|result|balance)|"
+    r"the\s+(?:figure|value|number|result|balance))\b",
+    re.IGNORECASE,
+)
+_PREVIOUS_MONTH_FOLLOW_UP = re.compile(
+    r"^\s*(?:previous|last)\s+month[.!?\s]*$",
+    re.IGNORECASE,
+)
+
+
+def _has_trusted_resourceplus_result(response: ChatResponse) -> bool:
+    return response.success and any(
+        tool.startswith(("get_", "create_", "cancel_", "book_", "approve_", "update_"))
+        for tool in response.tools_used
+    )
+
+
+def _model_retracts_trusted_result(
+    message: str,
+    trusted: TrustedResultContext,
+) -> bool:
+    english_retraction = bool(_TRUST_RETRACTION.search(message))
+    english_reference = bool(_TRUST_REFERENCE.search(message))
+    arabic_retraction = any(
+        phrase in message
+        for phrase in ("غير مدعوم", "لم يكن مدعوم", "غير صحيح", "خاطئ", "لا يمكن التحقق")
+    )
+    arabic_reference = any(
+        phrase in message
+        for phrase in ("السابق", "السابقة", "القيمة", "الرقم", "النتيجة", "الرصيد")
+    )
+    trusted_numbers = set(re.findall(r"\b\d+(?:\.\d+)?\b", trusted.message))
+    response_numbers = set(re.findall(r"\b\d+(?:\.\d+)?\b", message))
+    shared_number = bool(trusted_numbers & response_numbers)
+    return (english_retraction and (english_reference or shared_number)) or (
+        arabic_retraction and (arabic_reference or shared_number)
+    )
+
+
+def _grounding_guard_message(trusted: TrustedResultContext, language: str) -> str:
+    is_balance = "get_exceptional_entry_balance" in trusted.tools_used
+    if language == "ar":
+        return (
+            "تم جلب رصيدك السابق من سجل الموارد البشرية. يمكنني تحديثه إذا رغبت."
+            if is_balance
+            else "تم جلب النتيجة السابقة من سجل الموارد البشرية. يمكنني تحديثها إذا رغبت."
+        )
+    return (
+        "Your previous balance came from a completed HR balance check. I can refresh it if you'd like."
+        if is_balance
+        else "That earlier result came from a completed HR data check. I can refresh it if you'd like."
+    )
+
 ACTION_RESULT_MESSAGES = {
     "create_exceptional_entry": {
         "submitted_for_approval": {
             "en": {
-                "display": "Your exceptional-entry request was submitted successfully for approval.",
-                "speech": "Your exceptional-entry request was submitted for approval successfully.",
+                "display": "Your exceptional-entry request was submitted for approval.",
+                "speech": "Your exceptional-entry request was submitted for approval.",
             },
             "ar": {
                 "display": "تم إرسال طلب الإدخال الاستثنائي للموافقة بنجاح.",
@@ -179,7 +249,41 @@ ACTION_RESULT_MESSAGES = {
                 ),
             },
         },
-    }
+    },
+    "cancel_exceptional_entry": {
+        "cancelled": {
+            "en": {
+                "display": "Your pending exceptional-entry request was cancelled.",
+                "speech": "Your pending exceptional-entry request was cancelled.",
+            },
+            "ar": {
+                "display": "تم إلغاء طلب الإدخال الاستثنائي المعلّق.",
+                "speech": "تم إلغاء طلب الإدخال الاستثنائي المعلّق.",
+            },
+        },
+        "failed": {
+            "en": {
+                "display": "ResourcePlus could not cancel that exceptional-entry request.",
+                "speech": "ResourcePlus couldn't cancel that exceptional-entry request.",
+            },
+            "ar": {
+                "display": "تعذّر على ResourcePlus إلغاء طلب الإدخال الاستثنائي.",
+                "speech": "تعذّر على ResourcePlus إلغاء طلب الإدخال الاستثنائي.",
+            },
+        },
+    },
+    "create_exceptional_entry_from_summary": {
+        "failed": {
+            "en": {
+                "display": "ResourcePlus could not submit the less-hours correction. It was not recorded.",
+                "speech": "ResourcePlus couldn't submit the less-hours correction, so it wasn't recorded.",
+            },
+            "ar": {
+                "display": "تعذّر على ResourcePlus إرسال تصحيح الساعات الناقصة، ولم يتم تسجيله.",
+                "speech": "تعذّر على ResourcePlus إرسال تصحيح الساعات الناقصة، ولم يتم تسجيله.",
+            },
+        },
+    },
 }
 
 
@@ -235,13 +339,17 @@ def _draft_cancelled_message(language: str) -> str:
 
 
 def _unambiguous_english_decision(message: str, language: str) -> str:
-    if language != "en":
-        return "OTHER"
     normalized = _normalized_reply(message)
-    if normalized in UNAMBIGUOUS_ENGLISH_CONFIRMATIONS:
-        return "CONFIRM"
-    if normalized in UNAMBIGUOUS_ENGLISH_REJECTIONS:
-        return "REJECT"
+    if language == "en":
+        if normalized in UNAMBIGUOUS_ENGLISH_CONFIRMATIONS:
+            return "CONFIRM"
+        if normalized in UNAMBIGUOUS_ENGLISH_REJECTIONS:
+            return "REJECT"
+    if language == "ar":
+        if normalized in UNAMBIGUOUS_ARABIC_CONFIRMATIONS:
+            return "CONFIRM"
+        if normalized in UNAMBIGUOUS_ARABIC_REJECTIONS:
+            return "REJECT"
     return "OTHER"
 
 
@@ -282,18 +390,103 @@ def _response_message(result: object) -> tuple[bool, str]:
     return success, message
 
 
-def _safe_action_result(action_type: str, success: bool) -> str:
+def _from_summary_operation_success(result: object) -> bool:
+    """Apply the documented v2 success flag, with one narrow legacy fallback."""
+
+    if not isinstance(result, dict):
+        return False
+    if "success" in result:
+        return result.get("success") is True
+    # Compatibility for early v2 responses that emitted only isAutoApproved.
+    # Either boolean value represented an accepted operation: true meant immediate
+    # approval and false meant manager approval. No other field implies success.
+    return isinstance(result.get("isAutoApproved"), bool)
+
+
+def _safe_action_result(
+    action_type: str,
+    success: bool,
+    operation_result: object | None = None,
+) -> str:
     if not success:
         return "failed"
     if action_type in {"book_day_type", "create_exceptional_entry"}:
         return "submitted_for_approval"
-    if action_type == "cancel_day_type_request":
+    if action_type == "create_exceptional_entry_from_summary":
+        return (
+            "auto_approved"
+            if isinstance(operation_result, dict)
+            and operation_result.get("isAutoApproved") is True
+            else "submitted_for_approval"
+        )
+    if action_type in {"cancel_day_type_request", "cancel_exceptional_entry"}:
         return "cancelled"
     if action_type in {"approve_supervisor_request", "approve_all_requests"}:
         return "approved"
     if action_type == "update_notification_read_status":
         return "updated"
     return "succeeded"
+
+
+def _from_summary_result_message(
+    result: object,
+    language: str,
+    *,
+    success: bool,
+) -> str | None:
+    if not isinstance(result, dict):
+        return None
+    api_message = result.get("message")
+    warning = result.get("warning")
+    requested = result.get("requestedMinutes")
+    remaining = result.get("remaining")
+    resets_on = result.get("resetsOn")
+    auto_approved = result.get("isAutoApproved")
+    if language == "ar":
+        if not success:
+            lead = "تعذّر إكمال تصحيح حضورك."
+        elif auto_approved is True:
+            lead = "تمت الموافقة تلقائيًا على تصحيح حضورك."
+        elif auto_approved is False:
+            lead = "تم إرسال تصحيح حضورك وهو بانتظار موافقة المدير."
+        else:
+            lead = "تم إكمال تصحيح حضورك."
+        facts = []
+        if success:
+            if requested is not None:
+                facts.append(f"الدقائق المطلوبة: {requested}.")
+            if remaining is not None:
+                facts.append(f"المتبقي: {remaining} دقيقة.")
+            if resets_on not in (None, ""):
+                facts.append(f"إعادة التعيين: {resets_on}.")
+        parts = [lead, *facts]
+        if isinstance(api_message, str) and api_message.strip():
+            parts.append(api_message.strip())
+        if isinstance(warning, str) and warning.strip():
+            parts.append(f"تنبيه: {warning.strip()}")
+        return " ".join(parts)
+    if not success:
+        lead = "Your attendance correction could not be completed."
+    elif auto_approved is True:
+        lead = "Your attendance correction was auto-approved."
+    elif auto_approved is False:
+        lead = "Your attendance correction was submitted and is waiting for manager approval."
+    else:
+        lead = "Your attendance correction was completed."
+    facts = []
+    if success:
+        if requested is not None:
+            facts.append(f"Requested: {requested} minutes.")
+        if remaining is not None:
+            facts.append(f"Remaining allowance: {remaining} minutes.")
+        if resets_on not in (None, ""):
+            facts.append(f"Resets on {resets_on}.")
+    parts = [lead, *facts]
+    if isinstance(api_message, str) and api_message.strip():
+        parts.append(api_message.strip())
+    if isinstance(warning, str) and warning.strip():
+        parts.append(f"Warning: {warning.strip()}")
+    return " ".join(parts)
 
 
 def _deterministic_action_result(
@@ -375,11 +568,19 @@ async def process_chat(
 
     identity_token = bind_request_identity(identity)
     try:
-        return await _process_chat(
+        response = await _process_chat(
             request,
             detected_language=detected_language,
             store=store,
         )
+        if _has_trusted_resourceplus_result(response):
+            store.save_trusted_result(
+                response.session_id,
+                message=response.message,
+                tools_used=response.tools_used,
+                language=response.language,
+            )
+        return response
     except SessionIdentityMismatch:
         record_safe_error("access_denied")
         message = (
@@ -533,7 +734,13 @@ async def _process_chat(
             )
             raise
         success, source_message = _response_message(operation_result)
-        action_result = _safe_action_result(action.action_type, success)
+        if action.action_type == "create_exceptional_entry_from_summary":
+            success = _from_summary_operation_success(operation_result)
+        action_result = _safe_action_result(
+            action.action_type,
+            success,
+            operation_result,
+        )
         record_action_state(
             action_type=action.action_type,
             state="executed" if success else "failed",
@@ -541,12 +748,30 @@ async def _process_chat(
             confirmed=True,
             result=action_result,
         )
+        response_blocks = []
+        from_summary_message = (
+            _from_summary_result_message(
+                operation_result,
+                flow_language,
+                success=success,
+            )
+            if action.action_type == "create_exceptional_entry_from_summary"
+            else None
+        )
         deterministic_result = _deterministic_action_result(
             action.action_type,
             action_result,
             flow_language,
         )
-        if deterministic_result is None:
+        if from_summary_message is not None:
+            message = from_summary_message
+            speech_message = message
+            response_blocks = exceptional_submission_blocks(
+                operation_result,
+                language=flow_language,
+                success=success,
+            )
+        elif deterministic_result is None:
             message = await _render_or_fallback(
                 source_message,
                 language=flow_language,
@@ -564,6 +789,7 @@ async def _process_chat(
             language=flow_language,
             tools_used=[action.action_type],
             session_id=session_id,
+            blocks=response_blocks,
         ).set_speech_message(speech_message)
 
     if pending is not None and decision == "REJECT":
@@ -602,6 +828,7 @@ async def _process_chat(
             session_id=session_id,
             requires_confirmation=True,
             confirmation_id=pending.confirmation_id,
+            blocks=[confirmation_block(message, flow_language)],
         ).set_speech_message(message)
 
     if is_ambiguous_transactional_utterance(request.message):
@@ -623,7 +850,9 @@ async def _process_chat(
         ).set_speech_message(message)
 
     existing_late_punch = is_existing_late_punch(request.message)
-    if existing_late_punch or is_prospective_late_arrival(request.message):
+    if (
+        existing_late_punch or is_prospective_late_arrival(request.message)
+    ) and not is_less_hours_request(request.message):
         # A prospective arrival delay is not an existing attendance record to repair.
         # Clear only a non-executable reason draft so it cannot hijack this new topic.
         store.clear_exceptional_entry_draft(session_id)
@@ -688,6 +917,9 @@ async def _process_chat(
                         {"label": name, "value": name}
                         for name in (exc.reason_options or [])
                     ] or None,
+                    blocks=[reason_actions(exc.reason_options or [], draft.language)]
+                    if exc.reason_options
+                    else [],
                 ).set_speech_message(message)
             except ResourcePlusError:
                 record_safe_error("resourceplus_error")
@@ -747,6 +979,7 @@ async def _process_chat(
                 session_id=session_id,
                 requires_confirmation=True,
                 confirmation_id=pending_action.confirmation_id,
+                blocks=[confirmation_block(message, draft.language)],
             ).set_speech_message(message)
 
         if draft_follow_up == "new_intent":
@@ -759,6 +992,75 @@ async def _process_chat(
             # Keep the recoverable draft, but do not feed its reason-question history
             # into this ordinary conversational turn.
             ignore_prior_history_for_topic_change = True
+
+    trusted_context = store.get_trusted_result(session_id)
+    contextual_fast_read: str | None = None
+    if is_noisy_balance_reference(request.message):
+        if (
+            trusted_context is not None
+            and "get_exceptional_entry_balance" in trusted_context.tools_used
+        ):
+            contextual_fast_read = "Show my buffer balance"
+        else:
+            message = "Do you mean your remaining buffer time?"
+            store.append_history(session_id, "user", request.message)
+            store.append_history(session_id, "assistant", message)
+            return ChatResponse(
+                success=True,
+                message=message,
+                language=language,
+                session_id=session_id,
+            ).set_speech_message(message)
+    elif (
+        trusted_context is not None
+        and "get_attendance_summary" in trusted_context.tools_used
+        and _PREVIOUS_MONTH_FOLLOW_UP.match(request.message)
+    ):
+        contextual_fast_read = "Show my attendance previous month"
+
+    if contextual_fast_read is not None:
+        fast_result = await try_fast_read(
+            contextual_fast_read,
+            lang=lang,
+            response_language=language,
+        )
+        if fast_result is not None:
+            store.append_history(session_id, "user", request.message)
+            store.append_history(session_id, "assistant", fast_result.message)
+            return ChatResponse(
+                success=True,
+                message=fast_result.message,
+                language=language,
+                tools_used=fast_result.tools_used,
+                session_id=session_id,
+                blocks=fast_result.blocks,
+            ).set_speech_message(fast_result.speech_message)
+
+    conversational = await continue_conversation(
+        request.message,
+        lang=lang,
+        session_id=session_id,
+        language=language,
+        store=store,
+    )
+    if conversational is not None:
+        store.append_history(session_id, "user", request.message)
+        store.append_history(session_id, "assistant", conversational.message)
+        return ChatResponse(
+            success=conversational.success,
+            message=conversational.message,
+            language=language,
+            tools_used=conversational.tools_used,
+            session_id=session_id,
+            requires_confirmation=conversational.requires_confirmation,
+            confirmation_id=conversational.confirmation_id,
+            needs_reason=conversational.needs_reason,
+            reason_options=[
+                {"label": name, "value": name}
+                for name in (conversational.reason_options or [])
+            ] or None,
+            blocks=conversational.blocks,
+        ).set_speech_message(conversational.speech_message)
 
     if expired or decision in {"CONFIRM", "REJECT"}:
         message = _confirmation_message(
@@ -783,6 +1085,22 @@ async def _process_chat(
         ),
         response_language=language,
     )
+    refreshed_same_source = bool(
+        trusted_context is not None
+        and not result.tool_failed
+        and set(trusted_context.tools_used) & set(result.tools_used)
+    )
+    if (
+        trusted_context is not None
+        and not refreshed_same_source
+        and _model_retracts_trusted_result(result.message, trusted_context)
+    ):
+        guarded_message = _grounding_guard_message(trusted_context, language)
+        result = AgentResult(
+            message=guarded_message,
+            speech_message=guarded_message,
+            tools_used=[],
+        )
     store.append_history(session_id, "user", request.message)
     store.append_history(session_id, "assistant", result.message)
     if result.requires_confirmation:
@@ -794,7 +1112,12 @@ async def _process_chat(
                 confirmation_required=True,
                 confirmed=False,
             )
-    return ChatResponse(
+    response_blocks = list(result.blocks or [])
+    if result.requires_confirmation and result.confirmation_id and not response_blocks:
+        response_blocks.append(confirmation_block(result.message, language))
+    if result.needs_reason and result.reason_options and not response_blocks:
+        response_blocks.append(reason_actions(result.reason_options, language))
+    response = ChatResponse(
         success=not result.tool_failed,
         message=result.message,
         language=language,
@@ -807,4 +1130,17 @@ async def _process_chat(
             {"label": name, "value": name}
             for name in (result.reason_options or [])
         ] or None,
+        blocks=response_blocks,
     ).set_speech_message(result.speech_message)
+    if "get_missing_punch_suggestions" in result.tools_used:
+        today = resourceplus_today()
+        store.save_conversation_draft(
+            session_id,
+            intent="missing_punch_context",
+            slots={
+                "period_start": today.replace(day=1).isoformat(),
+                "period_end": today.isoformat(),
+            },
+            language=language,
+        )
+    return response

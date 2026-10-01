@@ -58,6 +58,7 @@ ERROR_STAGES = frozenset(
         "confirmation_classifier",
         "response_renderer",
         "agent",
+        "router",
         "resourceplus",
         "speech_normalization",
         "tts",
@@ -97,6 +98,11 @@ ERROR_OWNER_BY_CATEGORY = {
     "azure_canceled": "azure_stt",
     "speech_recognition_failed": "azure_stt",
     "speech_synthesis_failed": "azure_tts",
+    "timeout": "azure_tts",
+    "cancelled": "azure_tts",
+    "network": "azure_tts",
+    "auth_config": "azure_tts",
+    "service_unavailable": "azure_tts",
     "voice_unavailable": "configuration",
     "invalid_stream_state": "validation",
     "stream_finalize_timeout": "azure_stt",
@@ -124,6 +130,11 @@ ERROR_STAGE_BY_CATEGORY = {
     "azure_canceled": "stt",
     "speech_recognition_failed": "stt",
     "speech_synthesis_failed": "tts",
+    "timeout": "tts",
+    "cancelled": "tts",
+    "network": "tts",
+    "auth_config": "tts",
+    "service_unavailable": "tts",
     "voice_unavailable": "configuration",
     "invalid_stream_state": "audio_stream",
     "stream_finalize_timeout": "post_release_stt_finalize",
@@ -380,6 +391,9 @@ class MetricsRegistry:
         "resourceplus_assistant_resourceplus_request_duration_ms": ("method", "status"),
         "resourceplus_assistant_azure_stt_duration_ms": ("status",),
         "resourceplus_assistant_azure_tts_duration_ms": ("status",),
+        "resourceplus_assistant_text_first_status_ms": ("mode",),
+        "resourceplus_assistant_text_first_text_ms": ("mode",),
+        "resourceplus_assistant_text_total_ms": ("mode", "status"),
     }
     ALLOWED_LABEL_VALUES: Mapping[str, frozenset[str]] = {
         "mode": frozenset({"text", "voice", "other"}),
@@ -388,6 +402,7 @@ class MetricsRegistry:
         "route": frozenset(
             {
                 "chat",
+                "chat_stream",
                 "voice_chat",
                 "frontend_telemetry",
                 "health",
@@ -518,6 +533,7 @@ metrics = MetricsRegistry()
 def route_label(path: str) -> str:
     return {
         "/api/chat": "chat",
+        "/api/chat/stream": "chat_stream",
         "/api/voice/chat": "voice_chat",
         "/api/telemetry/frontend": "frontend_telemetry",
         "/health": "health",
@@ -529,7 +545,7 @@ def route_label(path: str) -> str:
 
 
 def request_mode(path: str) -> str:
-    if path == "/api/chat":
+    if path in {"/api/chat", "/api/chat/stream"}:
         return "text"
     if path.startswith("/api/voice/"):
         return "voice"

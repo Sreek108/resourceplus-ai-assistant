@@ -13,7 +13,9 @@ from app.ai.tools import (
     execute_tool,
 )
 from app.config import get_settings
-from app.observability import measure_model_call
+from app.observability import measure_model_call, measure_stage
+from app.models.schemas import ResponseBlock
+from app.services.fast_reads import classify_fast_read, try_fast_read
 from app.speech.language import detect_text_language
 
 
@@ -56,6 +58,7 @@ class AgentResult:
     speech_message: str | None = None
     needs_reason: bool = False
     reason_options: list[str] | None = None
+    blocks: list[ResponseBlock] | None = None
 
 
 def _assistant_messages(output_text: str) -> tuple[str, str | None]:
@@ -87,6 +90,21 @@ async def run_agent(
     response_language: str | None = None,
 ) -> AgentResult:
     settings = get_settings()
+    with measure_stage("router"):
+        fast_read_intents = classify_fast_read(message)
+    if getattr(settings, "deterministic_read_fast_paths", False) and fast_read_intents:
+        fast_result = await try_fast_read(
+            message,
+            lang=lang,
+            response_language=response_language or detect_language(message),
+        )
+        if fast_result is not None:
+            return AgentResult(
+                message=fast_result.message,
+                speech_message=fast_result.speech_message,
+                tools_used=fast_result.tools_used,
+                blocks=fast_result.blocks,
+            )
     if not settings.openai_api_key:
         raise AIConfigurationError("OPENAI_API_KEY is not configured.")
     if not settings.openai_model:
@@ -111,6 +129,7 @@ async def run_agent(
     )
     input_items: list[Any] = [*(history or []), {"role": "user", "content": message}]
     tools_used: list[str] = []
+    trusted_blocks: list[ResponseBlock] = []
     tool_failed = False
     client = AsyncOpenAI(api_key=settings.openai_api_key)
 
@@ -139,6 +158,7 @@ async def run_agent(
                     tools_used,
                     tool_failed,
                     speech_message=speech,
+                    blocks=trusted_blocks or None,
                 )
 
             # Preserve every output item, including reasoning items, before returning
@@ -176,6 +196,8 @@ async def run_agent(
                             tools_used.pop()
                         result_output = result.output
                         failed = result.failed
+                        if result.blocks:
+                            trusted_blocks.extend(result.blocks)
                         if result.pending_action is not None:
                             pending_action = result.pending_action
                         if result.terminal_message is not None:
@@ -186,6 +208,7 @@ async def run_agent(
                                 speech_message=result.terminal_message,
                                 needs_reason=result.needs_reason,
                                 reason_options=result.reason_options,
+                                blocks=trusted_blocks or None,
                             )
                 tool_failed = tool_failed or failed
                 input_items.append(
@@ -218,6 +241,7 @@ async def run_agent(
                         requires_confirmation=True,
                         confirmation_id=pending_action.confirmation_id,
                         speech_message=speech,
+                        blocks=trusted_blocks or None,
                     )
     except OpenAIServiceError:
         raise

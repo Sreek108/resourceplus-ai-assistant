@@ -48,6 +48,46 @@ function demoIdentityFields(email, instance) {
     : {};
 }
 
+function recoverCompletedVoiceTtsFailure(payload) {
+  const detail = payload?.detail;
+  const completed = detail?.response;
+  const hasConfirmation = Boolean(completed?.requires_confirmation);
+  if (
+    detail?.code !== "speech_synthesis_failed"
+    || detail?.error_category !== "speech_synthesis_failed"
+    || detail?.result_status !== "completed_with_tts_error"
+    || detail?.tts_generated !== false
+    || completed?.success !== true
+    || typeof completed?.message !== "string"
+    || !completed.message.trim()
+    || typeof completed?.language !== "string"
+    || detail?.response_language !== completed.language
+    || detail?.assistant_text !== completed.message
+    || typeof completed?.session_id !== "string"
+    || !completed.session_id.trim()
+    || typeof detail?.transcript !== "string"
+    || !detail.transcript.trim()
+    || typeof detail?.detected_language !== "string"
+    || !detail.detected_language.trim()
+    || (hasConfirmation && (
+      typeof completed?.confirmation_id !== "string"
+      || !completed.confirmation_id.trim()
+    ))
+  ) {
+    return null;
+  }
+  return {
+    ...completed,
+    transcript: detail.transcript,
+    detected_language: detail.detected_language || completed.language,
+    detected_locale: detail.detected_locale,
+    audio_base64: "",
+    audio_mime_type: "audio/wav",
+    tts_unavailable: true,
+    tts_error_category: detail.error_category,
+  };
+}
+
 async function parseResponse(response, requestType) {
   let payload = null;
   try {
@@ -56,6 +96,10 @@ async function parseResponse(response, requestType) {
     // A non-JSON upstream failure is still reported using a safe status message.
   }
   if (!response.ok) {
+    if (requestType === "voice") {
+      const completedVoiceResult = recoverCompletedVoiceTtsFailure(payload);
+      if (completedVoiceResult) return completedVoiceResult;
+    }
     const serverCode = payload?.code || payload?.detail?.code;
     const failure = friendlyStatusMessage(response.status, requestType, serverCode);
     throw new ClientRequestError(failure.message, failure.code);
@@ -203,6 +247,7 @@ export function openVoiceStream({
   email,
   instance,
   debug = false,
+  onEvent,
 }) {
   let identity;
   try {
@@ -262,6 +307,7 @@ export function openVoiceStream({
         ...identity,
         ...(confirmationId ? { confirmation_id: confirmationId } : {}),
         ...(debug ? { debug: true } : {}),
+        ...(onEvent ? { progressive_events: true } : {}),
       }));
     };
     socket.onmessage = (event) => {
@@ -321,7 +367,15 @@ export function openVoiceStream({
         socket.close();
         return;
       }
+      if (["listening", "transcript_final", "processing", "assistant_text"].includes(payload.type)) {
+        onEvent?.(payload);
+        return;
+      }
       if (payload.type === "error") {
+        if (payload.scope === "tts") {
+          onEvent?.(payload);
+          return;
+        }
         fail(
           payload.message || "I couldnâ€™t process that voice message.",
           payload.code || "stream_failed",

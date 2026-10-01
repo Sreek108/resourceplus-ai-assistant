@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 import tempfile
 from dataclasses import dataclass
 from typing import Any
@@ -230,8 +231,31 @@ def _synthesize_sync(text: str, language: str) -> SpeechAudio:
         )
         result = synthesizer.speak_text_async(text).get()
         if result.reason != sdk.ResultReason.SynthesizingAudioCompleted:
+            category = "cancelled"
+            safe_code = "unavailable"
+            try:
+                details = sdk.SpeechSynthesisCancellationDetails.from_result(result)
+                raw_code = str(getattr(details, "error_code", "")).casefold()
+                raw_reason = str(getattr(details, "reason", "")).casefold()
+                safe_code = re.sub(r"[^a-z0-9_]+", "_", raw_code).strip("_")[:64] or "unavailable"
+                if "authentication" in raw_code or "forbidden" in raw_code:
+                    category = "auth_config"
+                elif "timeout" in raw_code or "timeout" in raw_reason:
+                    category = "timeout"
+                elif any(cue in raw_code for cue in ("connection", "network")):
+                    category = "network"
+                elif any(cue in raw_code for cue in ("service", "too_many", "quota")):
+                    category = "service_unavailable"
+            except Exception:
+                pass
+            logger.warning(
+                "Azure speech synthesis cancelled: category=%s code=%s",
+                category,
+                safe_code,
+            )
             raise SpeechSynthesisError(
-                "Speech synthesis is temporarily unavailable. Please try again."
+                "Speech synthesis is temporarily unavailable. Please try again.",
+                safe_category=category,
             )
         audio_data = bytes(result.audio_data)
         if not audio_data:
@@ -256,7 +280,31 @@ async def synthesize_speech(text: str, *, language: str) -> SpeechAudio:
     normalized = text.strip()
     if not normalized:
         raise SpeechInputError("The assistant response is empty.")
-    return await asyncio.to_thread(_synthesize_sync, normalized, language)
+    settings = get_settings()
+    attempts = 2 if getattr(settings, "azure_tts_transient_retry", True) else 1
+    transient = {"timeout", "network", "service_unavailable"}
+    for attempt in range(attempts):
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(_synthesize_sync, normalized, language),
+                timeout=getattr(settings, "azure_tts_timeout_seconds", 20.0),
+            )
+        except asyncio.TimeoutError as exc:
+            error = SpeechSynthesisError(
+                "Speech synthesis timed out.",
+                safe_category="timeout",
+            )
+            logger.warning("Azure speech synthesis failed: category=timeout")
+            if attempt + 1 >= attempts:
+                raise error from exc
+        except SpeechSynthesisError as exc:
+            logger.warning(
+                "Azure speech synthesis failed: category=%s",
+                exc.safe_category,
+            )
+            if exc.safe_category not in transient or attempt + 1 >= attempts:
+                raise
+    raise SpeechSynthesisError("Speech synthesis is temporarily unavailable.")
     default_safe_category = "voice_unavailable"
     default_safe_category = "speech_recognition_failed"
     default_safe_category = "speech_synthesis_failed"

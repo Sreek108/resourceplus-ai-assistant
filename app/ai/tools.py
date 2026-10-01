@@ -24,14 +24,19 @@ from app.resourceplus.attendance import (
     get_missing_punch_suggestions,
 )
 from app.resourceplus.employee import get_profile_data
+from app.resourceplus.exceptional import get_exceptional_entry_balance
 from app.resourceplus.home import get_home_data
 from app.resourceplus.leave import get_day_types
 from app.resourceplus.notifications import get_notifications
 from app.resourceplus.requests import get_my_request_status
+from app.resourceplus.reference_cache import cached_day_types, cached_exception_reasons
 from app.resourceplus.missing_punch import (
     missing_punch_tool_data,
     normalize_missing_punch_suggestions,
 )
+from app.models.schemas import ResponseBlock
+from app.services.response_blocks import attendance_blocks
+from app.time_context import resourceplus_today
 
 
 logger = logging.getLogger(__name__)
@@ -108,6 +113,23 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "name": "get_exception_reasons",
         "description": "Get valid ResourcePlus reasons for exceptional entries.",
         "parameters": _empty_schema(),
+        "strict": True,
+    },
+    {
+        "type": "function",
+        "name": "get_exceptional_entry_balance",
+        "description": (
+            "Get ResourcePlus's authoritative exceptional-entry allowance for one "
+            "date. The backend supplies employee identity."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "target_date": {"type": "string", "description": "YYYY-MM-DD"},
+            },
+            "required": ["target_date"],
+            "additionalProperties": False,
+        },
         "strict": True,
     },
     {
@@ -229,6 +251,49 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     },
     {
         "type": "function",
+        "name": "prepare_less_hours_correction",
+        "description": (
+            "Prepare, but do not submit, a ResourcePlus FromSummary less-hours "
+            "correction. Do not request a punch time or direction. entry_type is "
+            "allowed only when the employee explicitly asks for late IN only (1) "
+            "or early OUT only (2); minutes is allowed only when the employee "
+            "explicitly requests a partial number of minutes."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "target_date": {"type": "string", "description": "YYYY-MM-DD"},
+                "reason_name": {"type": ["string", "null"]},
+                "remarks": {"type": ["string", "null"]},
+                "entry_type": {"type": ["integer", "null"], "enum": [1, 2, None]},
+                "minutes": {"type": ["integer", "null"], "minimum": 1},
+            },
+            "required": ["target_date", "reason_name", "remarks", "entry_type", "minutes"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+    {
+        "type": "function",
+        "name": "prepare_cancel_exceptional_entry",
+        "description": (
+            "Find and prepare cancellation of one ResourcePlus-reported pending, "
+            "cancellable exceptional entry. Never accept or invent an exceptional ID."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "date_from": {"type": "string", "description": "YYYY-MM-DD"},
+                "date_to": {"type": "string", "description": "YYYY-MM-DD"},
+                "target_date": {"type": ["string", "null"], "description": "YYYY-MM-DD"},
+            },
+            "required": ["date_from", "date_to", "target_date"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+    {
+        "type": "function",
         "name": "prepare_cancel_day_type_request",
         "description": (
             "Find and prepare cancellation of one real pending absence request. Never "
@@ -328,6 +393,7 @@ READ_TOOL_NAMES = {
     "get_profile_data",
     "get_missing_punch_suggestions",
     "get_exception_reasons",
+    "get_exceptional_entry_balance",
     "get_day_types",
     "get_my_request_status",
     "get_pending_approvals",
@@ -335,6 +401,8 @@ READ_TOOL_NAMES = {
 }
 WRITE_INTENT_TOOL_NAMES = {
     "prepare_exceptional_entry",
+    "prepare_less_hours_correction",
+    "prepare_cancel_exceptional_entry",
     "prepare_book_day_type",
     "prepare_cancel_day_type_request",
     "prepare_supervisor_request",
@@ -360,6 +428,7 @@ class ToolExecutionResult:
     terminal_message: str | None = None
     needs_reason: bool = False
     reason_options: list[str] | None = None
+    blocks: list[ResponseBlock] | None = None
 
 
 def _write_intent_is_grounded(tool_name: str, message: str) -> bool:
@@ -378,6 +447,32 @@ def _write_intent_is_grounded(tool_name: str, message: str) -> bool:
                 r"\b(?:less\s+hours?|shortfall|attendance)\b",
                 normalized,
             )
+        )
+
+    if tool_name == "prepare_less_hours_correction":
+        return bool(
+            re.search(
+                r"\b(?:correct|fix|adjust|amend|regulari[sz]e)\b.{0,50}"
+                r"\b(?:less[-\s]+hours?|short\s+hours?|shortfall|late\s+arrival|early\s+departure|entry)\b",
+                normalized,
+            )
+        ) or bool(
+            re.search(
+                r"\b(?:use|apply)\b.{0,35}\b(?:buffer|excuse\s+time)\b",
+                normalized,
+            )
+        ) or (
+            any(cue in normalized for cue in ("صحح", "تصحيح", "عندي"))
+            and any(cue in normalized for cue in ("ساعات ناقصة", "نقص ساعات", "تأخر", "خروج مبكر"))
+        )
+
+    if tool_name == "prepare_cancel_exceptional_entry":
+        return (
+            bool(re.search(r"\b(?:cancel|withdraw)\b", normalized))
+            and bool(re.search(r"\b(?:exception|exceptional\s+entry)\b", normalized))
+        ) or (
+            any(cue in normalized for cue in ("إلغاء", "الغاء", "اسحب", "سحب"))
+            and any(cue in normalized for cue in ("استثنائي", "استثناء"))
         )
 
     if tool_name == "prepare_book_day_type":
@@ -419,7 +514,7 @@ def _write_intent_is_grounded(tool_name: str, message: str) -> bool:
 
 
 def _ungrounded_write_message(tool_name: str, language: str) -> str:
-    if tool_name == "prepare_exceptional_entry":
+    if tool_name in {"prepare_exceptional_entry", "prepare_less_hours_correction"}:
         if language == "ar":
             return "ما فهمت طلب تصحيح البصمة بوضوح. هل نسيت تسجيل الدخول أو الخروج؟"
         return (
@@ -431,6 +526,29 @@ def _ungrounded_write_message(tool_name: str, language: str) -> str:
     return "I didn't catch a clear request to change anything. Please repeat your request."
 
 
+def _grounded_less_hours_options(message: str) -> tuple[int | None, int | None]:
+    """Derive optional v2 write scope from employee words, never model arguments."""
+
+    normalized = " ".join(message.casefold().split())
+    entry_type: int | None = None
+    if re.search(r"\b(?:only\s+)?late\s+(?:in|arrival)\b", normalized) or any(
+        cue in normalized for cue in ("تأخر الدخول", "التأخر في الدخول", "الدخول المتأخر")
+    ):
+        entry_type = 1
+    elif re.search(r"\b(?:only\s+)?early\s+(?:out|departure)\b", normalized) or any(
+        cue in normalized for cue in ("خروج مبكر", "الخروج المبكر", "انصراف مبكر")
+    ):
+        entry_type = 2
+    minute_match = re.search(
+        r"\b(?:only\s+)?(\d{1,3})\s*(?:minutes?|mins?)\b",
+        normalized,
+    ) or re.search(r"(?:فقط\s*)?(\d{1,3})\s*د(?:قيقة|قائق)", normalized)
+    minutes = int(minute_match.group(1)) if minute_match else None
+    if minutes is not None and minutes <= 0:
+        minutes = None
+    return entry_type, minutes
+
+
 def resolve_relative_date_range(
     message: str,
     *,
@@ -438,17 +556,15 @@ def resolve_relative_date_range(
 ) -> DateRange | None:
     """Resolve supported relative periods without relying on the model."""
 
-    current = today or date.today()
+    current = today or resourceplus_today()
     normalized = message.casefold()
-    # English relative dates are resolved deterministically. Other languages are
-    # understood by the model and still receive the backend date in context; no
-    # language-specific command phrase map is maintained here.
     patterns: list[tuple[str, tuple[str, ...]]] = [
-        ("last_week", (r"\blast week\b",)),
-        ("this_week", (r"\bthis week\b",)),
-        ("this_month", (r"\bthis month\b",)),
-        ("yesterday", (r"\byesterday\b",)),
-        ("today", (r"\btoday\b",)),
+        ("last_week", (r"\blast week\b", "الأسبوع الماضي", "الاسبوع الماضي")),
+        ("previous_month", (r"\bprevious month\b", r"\blast month\b")),
+        ("this_week", (r"\bthis week\b", "هذا الأسبوع", "هذا الاسبوع", "الأسبوع الحالي", "الاسبوع الحالي")),
+        ("this_month", (r"\bthis month\b", "هذا الشهر", "الشهر الحالي")),
+        ("yesterday", (r"\byesterday\b", "أمس", "امس")),
+        ("today", (r"\btoday\b", "اليوم")),
     ]
     selected: str | None = None
     for label, variants in patterns:
@@ -471,13 +587,17 @@ def resolve_relative_date_range(
         this_week_start = current - timedelta(days=current.weekday())
         start = this_week_start - timedelta(days=7)
         return DateRange(selected, start, this_week_start - timedelta(days=1))
+    if selected == "previous_month":
+        current_month_start = current.replace(day=1)
+        end = current_month_start - timedelta(days=1)
+        return DateRange(selected, end.replace(day=1), end)
     if selected == "this_month":
         return DateRange(selected, current.replace(day=1), current)
     return None
 
 
 def date_context(message: str, *, today: date | None = None) -> tuple[str, DateRange | None]:
-    current = today or date.today()
+    current = today or resourceplus_today()
     resolved = resolve_relative_date_range(message, today=current)
     context = f"Backend date: {current.isoformat()}."
     if resolved:
@@ -539,6 +659,7 @@ async def execute_tool(
     response_language: str,
     resolved_range: DateRange | None = None,
     source_user_message: str | None = None,
+    trusted_conversation_intent: bool = False,
     store: SessionStore = session_store,
 ) -> ToolExecutionResult:
     if name not in ALLOWED_TOOL_NAMES:
@@ -582,7 +703,7 @@ async def execute_tool(
             if name == "prepare_exceptional_entry"
             else None
         )
-        if existing_draft is None and not _write_intent_is_grounded(
+        if existing_draft is None and not trusted_conversation_intent and not _write_intent_is_grounded(
             name,
             source_user_message,
         ):
@@ -618,9 +739,11 @@ async def execute_tool(
                 )
             )
         elif name == "get_exception_reasons":
-            data = await get_exception_reasons(lang=lang)
+            data = await cached_exception_reasons(lang)
+        elif name == "get_exceptional_entry_balance":
+            data = await get_exceptional_entry_balance(arguments.get("target_date"))
         elif name == "get_day_types":
-            data = await get_day_types(lang=lang)
+            data = await cached_day_types(lang)
         elif name == "get_my_request_status":
             start, end = _tool_dates(name, arguments, resolved_range)
             data = await get_my_request_status(start, end, lang=lang)
@@ -641,6 +764,14 @@ async def execute_tool(
                     intent_arguments["punch_direction"] = (
                         explicit_missing_punch_direction(source_user_message)
                     )
+            if name == "prepare_less_hours_correction" and source_user_message is not None:
+                intent_arguments["_user_message"] = source_user_message
+                if not trusted_conversation_intent:
+                    grounded_entry_type, grounded_minutes = _grounded_less_hours_options(
+                        source_user_message
+                    )
+                    intent_arguments["entry_type"] = grounded_entry_type
+                    intent_arguments["minutes"] = grounded_minutes
             if resolved_range and name == "prepare_exceptional_entry":
                 intent_arguments["_range_from"] = resolved_range.from_date.isoformat()
                 intent_arguments["_range_to"] = resolved_range.to_date.isoformat()
@@ -649,9 +780,16 @@ async def execute_tool(
                     and not intent_arguments.get("target_date")
                 ):
                     intent_arguments["target_date"] = resolved_range.from_date.isoformat()
+            if (
+                resolved_range
+                and name == "prepare_less_hours_correction"
+                and resolved_range.from_date == resolved_range.to_date
+            ):
+                intent_arguments["target_date"] = resolved_range.from_date.isoformat()
             if resolved_range and name in {
                 "prepare_book_day_type",
                 "prepare_cancel_day_type_request",
+                "prepare_cancel_exceptional_entry",
             }:
                 intent_arguments["date_from"] = resolved_range.from_date.isoformat()
                 intent_arguments["date_to"] = resolved_range.to_date.isoformat()
@@ -693,7 +831,11 @@ async def execute_tool(
         )
         if exc.category == "no_resourceplus_suggestion":
             record_safe_error(exc.category)
-        if exc.category == "reason_required" and exc.draft_context is not None:
+        if (
+            name == "prepare_exceptional_entry"
+            and exc.category == "reason_required"
+            and exc.draft_context is not None
+        ):
             store.create_exceptional_entry_draft(
                 session_id,
                 attendance_date=exc.draft_context["attendance_date"],
@@ -752,5 +894,6 @@ async def execute_tool(
             ),
         }
     return ToolExecutionResult(
-        json.dumps(payload, ensure_ascii=False, default=str)
+        json.dumps(payload, ensure_ascii=False, default=str),
+        blocks=attendance_blocks(data) if name == "get_attendance_summary" else None,
     )
