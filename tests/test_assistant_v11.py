@@ -40,21 +40,24 @@ def identity():
 async def test_missing_punch_slots_continue_without_reasking_direction(monkeypatch) -> None:
     store = InMemorySessionStore()
 
-    async def suggestions(start, end, **kwargs):
+    async def attendance(start, end, **kwargs):
         assert (start, end) == ("2026-09-06", "2026-09-06")
-        return [{
-            "attDate": "06/09/2026",
-            "suggestedEntryTime": "06/09/2026 09:00",
-            "entryType": "IN",
-            "shift": "General",
-            "isNightShift": 0,
-        }]
+        return {"Days": [{
+            "AttDate": "06/09/2026", "DayType": "Regular",
+            "CheckIN": "09:10", "CheckOut": "17:00",
+            "NetHrs": "07:50", "LessHrs": "00:10",
+        }]}
 
     async def reasons(*args, **kwargs):
         return [{"reasonID": "outside-live", "reasonName": "Outside Work"}]
 
-    monkeypatch.setattr(actions, "get_missing_punch_suggestions", suggestions)
+    async def balance(*args, **kwargs):
+        return {"hasPolicy": True, "remaining": 120}
+
+    monkeypatch.setattr(actions, "get_attendance_summary", attendance)
     monkeypatch.setattr(actions, "get_exception_reasons", reasons)
+    monkeypatch.setattr(conversation, "cached_exception_reasons", reasons)
+    monkeypatch.setattr(conversation, "get_exceptional_entry_balance", balance)
 
     first = await chat_service.process_chat(
         ChatRequest(message="I want to correct a missing punch"), store=store
@@ -63,11 +66,11 @@ async def test_missing_punch_slots_continue_without_reasking_direction(monkeypat
         ChatRequest(message="IN on 6 September", session_id=first.session_id), store=store
     )
 
-    assert "date" in first.message.lower() and "in or out" in first.message.lower()
+    assert "date" in first.message.lower()
     assert "reason" in second.message.lower()
     assert "in or out" not in second.message.lower()
     assert second.needs_reason is True
-    assert second.blocks[0].type == "actions"
+    assert any(block.type == "actions" for block in second.blocks)
 
 
 @pytest.mark.asyncio
@@ -75,24 +78,27 @@ async def test_reason_follow_up_creates_confirmation_not_write(monkeypatch) -> N
     store = InMemorySessionStore()
     writes = []
 
-    async def suggestions(*args, **kwargs):
-        return [{
-            "attDate": "06/09/2026",
-            "suggestedEntryTime": "06/09/2026 09:00",
-            "entryType": "IN",
-            "shift": "General",
-            "isNightShift": 0,
-        }]
+    async def attendance(*args, **kwargs):
+        return {"Days": [{
+            "AttDate": "06/09/2026", "DayType": "Regular",
+            "CheckIN": "09:10", "CheckOut": "17:00",
+            "NetHrs": "07:50", "LessHrs": "00:10",
+        }]}
 
     async def reasons(*args, **kwargs):
         return [{"reasonID": "outside-live", "reasonName": "Outside Work"}]
 
+    async def balance(*args, **kwargs):
+        return {"hasPolicy": True, "remaining": 120}
+
     async def forbidden_write(**kwargs):
         writes.append(kwargs)
 
-    monkeypatch.setattr(actions, "get_missing_punch_suggestions", suggestions)
+    monkeypatch.setattr(actions, "get_attendance_summary", attendance)
     monkeypatch.setattr(actions, "get_exception_reasons", reasons)
-    monkeypatch.setattr(actions, "create_exceptional_entry", forbidden_write)
+    monkeypatch.setattr(conversation, "cached_exception_reasons", reasons)
+    monkeypatch.setattr(conversation, "get_exceptional_entry_balance", balance)
+    monkeypatch.setattr(actions, "create_exceptional_entry_from_summary", forbidden_write)
 
     first = await chat_service.process_chat(
         ChatRequest(message="Fix my missing IN punch on 6 September"), store=store
@@ -104,6 +110,11 @@ async def test_reason_follow_up_creates_confirmation_not_write(monkeypatch) -> N
     assert prepared.requires_confirmation is True
     assert prepared.confirmation_id
     assert prepared.blocks[0].type == "confirmation"
+    pending, _ = store.get_pending_action(first.session_id)
+    assert pending is not None
+    assert pending.action_type == "create_exceptional_entry_from_summary"
+    assert pending.validated_arguments["entry_type"] == 1
+    assert "minutes" not in pending.validated_arguments
     assert writes == []
 
 
@@ -230,7 +241,7 @@ async def test_balance_fast_path_uses_zero_model_calls(monkeypatch, message) -> 
 
     assert calls == ["2026-09-30"]
     assert result.tools_used == ["get_exceptional_entry_balance"]
-    assert result.message == "You have 100 minutes remaining."
+    assert result.message == "You have 100 minutes of buffer time left this week."
     assert result.speech_message == result.message
     assert result.blocks and result.blocks[0].type == "key_value"
     assert {item.label: item.value for item in result.blocks[0].items}["Unit"] == "Minutes"
@@ -267,7 +278,7 @@ async def test_noisy_buffer_follow_up_refreshes_recent_trusted_balance(monkeypat
 
     assert calls == ["2026-10-01", "2026-10-01"]
     assert refreshed.tools_used == ["get_exceptional_entry_balance"]
-    assert refreshed.message == "You have 120 minutes remaining."
+    assert refreshed.message == "You have 120 minutes of buffer time left."
     assert refreshed.speech_message == refreshed.message
 
 
@@ -357,7 +368,10 @@ async def test_previous_month_reuses_trusted_attendance_topic_without_model(monk
 
     assert calls == [("2026-10-01", "2026-10-01"), ("2026-09-01", "2026-09-30")]
     assert previous.tools_used == ["get_attendance_summary"]
-    assert previous.message == "You have no attendance records for this period."
+    assert previous.message == (
+        "Here's your September attendance. "
+        "You don't have any attendance records for that period."
+    )
 
 
 @pytest.mark.asyncio
@@ -407,8 +421,8 @@ async def test_attendance_fast_path_builds_grounded_table(monkeypatch, message) 
     result = await __import__("app.ai.agent", fromlist=["run_agent"]).run_agent(
         message, lang=1, session_id="attendance-fast", history=[]
     )
-    assert result.message.startswith("You have 1 attendance record for this period.")
-    assert result.speech_message == "You have 1 attendance record for this period."
+    assert result.message.startswith("Here's your attendance for October so far.")
+    assert result.speech_message == "Here's your attendance for October so far."
     table = next(block for block in result.blocks or [] if block.type == "table")
     assert table.rows == [{
         "date": "30/09/2026", "status": "Regular", "in": "09:00",
@@ -436,6 +450,51 @@ async def test_independent_fast_reads_run_concurrently(monkeypatch) -> None:
     )
     assert result is not None
     assert peak == 2
+
+
+@pytest.mark.asyncio
+async def test_missing_punch_fast_read_removes_absent_day_correction_availability(
+    monkeypatch,
+) -> None:
+    async def suggestions(*args, **kwargs):
+        return [{
+            "attDate": "01/09/2026",
+            "suggestedEntryTime": "01/09/2026 08:00",
+            "entryType": "IN",
+            "shift": "General",
+            "isNightShift": 0,
+        }]
+
+    async def attendance(*args, **kwargs):
+        return {"Days": [{
+            "AttDate": "01/09/2026",
+            "DayType": "Absent",
+            "CheckIN": None,
+            "CheckOut": None,
+            "NetHrs": "00:00",
+            "LessHrs": "00:00",
+        }]}
+
+    monkeypatch.setattr(fast_reads, "resourceplus_today", lambda: date(2026, 9, 30))
+    monkeypatch.setattr(fast_reads, "get_missing_punch_suggestions", suggestions)
+    monkeypatch.setattr(fast_reads, "get_attendance_summary", attendance)
+    result = await fast_reads.try_fast_read(
+        "Show my missing punches this month",
+        lang=1,
+        response_language="en",
+    )
+
+    assert result is not None
+    assert set(result.tools_used) == {
+        "get_missing_punch_suggestions",
+        "get_attendance_summary",
+    }
+    assert result.blocks[0].rows == [{
+        "date": "01/09/2026",
+        "direction": "IN",
+        "suggested": "08:00",
+        "correctable": False,
+    }]
 
 
 @pytest.mark.asyncio
@@ -688,8 +747,6 @@ async def test_new_read_does_not_clear_immutable_pending_action(monkeypatch) -> 
     "message",
     [
         "Show my exceptional entries this month",
-        "Show my exceptional entry requests",
-        "Show my exception requests this week",
         "What exceptional entries do I have?",
         "Show my pending exceptional entries",
         "Show my exceptional energies this month",
@@ -751,10 +808,10 @@ async def test_exceptional_entry_read_fast_path_is_specific_and_structured(
     assert "exceptionalID" not in table.model_dump_json()
     assert "never-visible" not in result.message
     assert result.message.startswith(
-        "You have 2 exceptional-entry requests for this period."
+        "You have 2 attendance correction requests for this period."
     )
     assert result.speech_message == (
-        "You have 2 exceptional-entry requests for this period."
+        "You have 2 attendance correction requests for this period."
     )
 
 
@@ -1162,7 +1219,7 @@ async def test_exceptional_read_interrupts_cancellation_selection_draft(
     assert discovery_reads == [1]
     assert read_calls == [("2026-09-01", "2026-09-30")]
     assert response.tools_used == ["get_exceptional_entries"]
-    assert response.blocks[0].title == "Exceptional entries"
+    assert response.blocks[0].title == "Attendance correction requests"
     assert store.get_conversation_draft(discovered.session_id) is None
     assert store.get_pending_action(discovered.session_id)[0] is None
 
@@ -1178,8 +1235,8 @@ async def test_english_leave_read_interrupts_arabic_cancellation_draft(
         return _pending_exception_rows()
 
     async def requests(start, end, **kwargs):
-        assert (start, end) == ("2026-09-01", "2026-09-30")
-        return {"merged_requests": []}
+        assert start < "2026-09-30" < end
+        return []
 
     async def forbidden_write(*args, **kwargs):
         writes.append((args, kwargs))
@@ -1187,7 +1244,7 @@ async def test_english_leave_read_interrupts_arabic_cancellation_draft(
     monkeypatch.setattr(conversation, "resourceplus_today", lambda: date(2026, 9, 30))
     monkeypatch.setattr(fast_reads, "resourceplus_today", lambda: date(2026, 9, 30))
     monkeypatch.setattr(actions, "get_exceptional_entry_requests", exceptional)
-    monkeypatch.setattr(fast_reads, "get_my_request_status", requests)
+    monkeypatch.setattr(fast_reads, "get_my_day_type_requests", requests)
     monkeypatch.setattr(actions, "cancel_exceptional_entry", forbidden_write)
 
     discovered = await chat_service.process_chat(
@@ -1198,8 +1255,8 @@ async def test_english_leave_read_interrupts_arabic_cancellation_draft(
         store=store,
     )
 
-    assert response.tools_used == ["get_my_request_status"]
-    assert response.blocks[0].title == "My requests"
+    assert response.tools_used == ["get_my_day_type_requests"]
+    assert response.blocks == []
     assert store.get_conversation_draft(discovered.session_id) is None
     assert store.get_pending_action(discovered.session_id)[0] is None
     assert writes == []

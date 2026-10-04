@@ -189,7 +189,14 @@ function friendlyStatusMessage(status, requestType, serverCode) {
   return { code: "request_failed", message: "Something went wrong. Please try again." };
 }
 
-export async function sendChat({ message, sessionId, confirmationId, email, instance }) {
+export async function sendChat({
+  message,
+  sessionId,
+  confirmationId,
+  email,
+  instance,
+  approvalSelection,
+}) {
   try {
     const identity = demoIdentityFields(email, instance);
     const response = await fetch(`${API_BASE_URL}/api/chat`, {
@@ -200,6 +207,7 @@ export async function sendChat({ message, sessionId, confirmationId, email, inst
         ...(sessionId ? { session_id: sessionId } : {}),
         ...identity,
         ...(confirmationId ? { confirmation_id: confirmationId } : {}),
+        ...(approvalSelection ? { approval_selection: approvalSelection } : {}),
       }),
     });
     return await parseResponse(response, "text");
@@ -234,6 +242,25 @@ export async function sendVoice({ audio, sessionId, confirmationId, email, insta
     if (error instanceof TypeError) {
       throw new ClientRequestError(
         "I couldn’t connect to voice right now. You can keep chatting by typing.",
+        "network_failure",
+      );
+    }
+    throw error;
+  }
+}
+
+export async function synthesizeVoice({ text, language }) {
+  try {
+    const response = await fetch(`${API_BASE_URL}/api/voice/synthesize`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text, language }),
+    });
+    return await parseResponse(response, "voice");
+  } catch (error) {
+    if (error instanceof TypeError) {
+      throw new ClientRequestError(
+        "I couldn’t connect to voice right now. Please try again.",
         "network_failure",
       );
     }

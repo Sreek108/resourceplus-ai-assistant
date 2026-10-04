@@ -1,9 +1,9 @@
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
-from app.ai import actions
+from app.ai import actions, conversation
 from app.ai.agent import AgentResult
 from app.ai.sessions import InMemorySessionStore
 from app.ai.tools import execute_tool
@@ -462,15 +462,38 @@ async def test_supported_hr_intent_abandons_reason_draft_and_routes_normally(
         no_reason_follow_up,
     )
     monkeypatch.setattr(actions, "create_exceptional_entry", no_resourceplus_write)
+    if tool_name == "prepare_exceptional_entry":
+        day = actions.LessHoursDay(
+            date(2026, 10, 1), "Regular", "09:10", "17:00",
+            "07:50", "00:10", "eligible", {},
+        )
+
+        async def inspect(*args, **kwargs):
+            return actions.LessHoursInspection((day,), (day,))
+
+        async def reasons(*args, **kwargs):
+            return [{"reasonID": "live-id", "reasonName": "Traffic"}]
+
+        async def balance(*args, **kwargs):
+            return {"hasPolicy": True, "remaining": 120}
+
+        monkeypatch.setattr(conversation, "inspect_less_hours_period", inspect)
+        monkeypatch.setattr(conversation, "cached_exception_reasons", reasons)
+        monkeypatch.setattr(conversation, "get_exceptional_entry_balance", balance)
     response = await chat_service.process_chat(
         ChatRequest(message=message, session_id=session_id),
         detected_language="en",
         store=store,
     )
 
-    assert response.message == agent_message
+    if tool_name == "prepare_exceptional_entry":
+        assert response.needs_reason is True
+        assert "reason" in response.message.lower()
+        assert agent_calls == 0
+    else:
+        assert response.message == agent_message
+        assert agent_calls == 1
     assert "couldn't match that reason" not in response.message
-    assert agent_calls == 1
     assert store.get_exceptional_entry_draft(session_id) is None
     assert store.get_pending_action(session_id)[0] is None
 
@@ -629,13 +652,31 @@ async def test_arabic_missing_punch_intent_is_not_consumed_as_reason(monkeypatch
         "prepare_exceptional_entry_reason_follow_up",
         no_reason_follow_up,
     )
+    day = actions.LessHoursDay(
+        date(2026, 10, 1), "Regular", "09:10", "17:00",
+        "07:50", "00:10", "eligible", {},
+    )
+
+    async def inspect(*args, **kwargs):
+        return actions.LessHoursInspection((day,), (day,))
+
+    async def reasons(*args, **kwargs):
+        return [{"reasonID": "live-id", "reasonName": "Traffic"}]
+
+    async def balance(*args, **kwargs):
+        return {"hasPolicy": True, "remaining": 120}
+
+    monkeypatch.setattr(conversation, "inspect_less_hours_period", inspect)
+    monkeypatch.setattr(conversation, "cached_exception_reasons", reasons)
+    monkeypatch.setattr(conversation, "get_exceptional_entry_balance", balance)
     response = await chat_service.process_chat(
         ChatRequest(message=message, session_id=session_id),
         detected_language="ar",
         store=store,
     )
 
-    assert response.message == "أي بصمة تريد تصحيحها؟"
+    assert response.needs_reason is True
+    assert response.message.endswith("وش سبب التصحيح؟")
     assert store.get_exceptional_entry_draft(session_id) is None
     assert store.get_pending_action(session_id)[0] is None
 
@@ -659,7 +700,7 @@ async def test_cancel_clears_non_executable_draft_without_post(monkeypatch) -> N
 
     assert response.success is True
     assert response.requires_confirmation is False
-    assert "Nothing was submitted" in response.message
+    assert response.message == "Okay, I won't submit it."
     assert store.get_exceptional_entry_draft(session_id) is None
     assert store.get_pending_action(session_id)[0] is None
 
@@ -686,7 +727,7 @@ async def test_arabic_draft_preserves_transaction_language(monkeypatch) -> None:
 
     assert response.language == "ar"
     assert response.requires_confirmation is True
-    assert "إرسال طلب إدخال استثنائي" in response.message
+    assert "طلب تصحيح البصمة" in response.message
     assert "ظروف عائلية" in response.message
     assert calls == {"suggestions": 1, "reasons": 1, "posts": 0}
 
@@ -839,10 +880,10 @@ async def test_english_transaction_ignores_arabic_resourceplus_success(monkeypat
     assert executions[0] == pending.validated_arguments
     assert response.language == "en"
     assert response.message == (
-        "Your exceptional-entry request was submitted for approval."
+        "I've sent your attendance correction for approval."
     )
     assert response.speech_message == (
-        "Your exceptional-entry request was submitted for approval."
+        "I've sent your attendance correction for approval."
     )
     assert "تم تسجيل" not in response.message
     assert audit.action_state == "executed"
@@ -878,9 +919,9 @@ async def test_arabic_transaction_ignores_english_resourceplus_success(monkeypat
 
     assert executions == 1
     assert response.language == "ar"
-    assert response.message == "تم إرسال طلب الإدخال الاستثنائي للموافقة بنجاح."
-    assert response.speech_message == "تم إرسال طلب الإدخال الاستثنائي للموافقة بنجاح."
-    assert "الإدخال الاستثنائي" in response.message
+    assert response.message == "أرسلت تصحيح حضورك للموافقة."
+    assert response.speech_message == "أرسلت تصحيح حضورك للموافقة."
+    assert "تصحيح حضورك" in response.message
     assert "للموافقة" in response.message
     assert "Entry recorded" not in response.message
 
@@ -911,7 +952,7 @@ async def test_short_arabic_confirmation_does_not_flip_english_transaction(
     )
 
     assert response.language == "en"
-    assert response.message.startswith("Your exceptional-entry request")
+    assert response.message.startswith("I've sent your attendance correction")
 
 
 @pytest.mark.asyncio
@@ -940,12 +981,10 @@ async def test_known_failure_is_rendered_in_transaction_language(monkeypatch) ->
     assert response.success is False
     assert response.language == "en"
     assert response.message == (
-        "ResourcePlus could not submit the exceptional-entry request. "
-        "The request was not recorded."
+        "I couldn't send your attendance correction. Nothing was recorded."
     )
     assert response.speech_message == (
-        "ResourcePlus couldn't submit your exceptional-entry request, "
-        "so it wasn't recorded."
+        "I couldn't send your attendance correction, so nothing was recorded."
     )
 
 
@@ -986,8 +1025,7 @@ async def test_upstream_500_is_failed_deterministic_and_not_replayable(
 
     assert response.success is False
     assert response.message == (
-        "ResourcePlus could not submit the exceptional-entry request. "
-        "The request was not recorded."
+        "I couldn't send your attendance correction. Nothing was recorded."
     )
     assert "success" not in response.message.casefold()
     assert response.display_message == response.message
@@ -1037,10 +1075,8 @@ async def test_upstream_500_uses_arabic_transaction_failure_message(monkeypatch)
     assert response.success is False
     assert response.language == "ar"
     assert response.message == (
-        "تعذّر على ResourcePlus إرسال طلب الإدخال الاستثنائي. "
-        "لم يتم تسجيل الطلب."
+        "ما قدرت أرسل تصحيح حضورك. ما تسجّل أي طلب."
     )
     assert response.speech_message == (
-        "ما قدر ResourcePlus يرسل طلب الإدخال الاستثنائي، "
-        "وعشان كذا الطلب ما تسجّل."
+        "ما قدرت أرسل تصحيح حضورك، وما تسجّل أي طلب."
     )

@@ -85,4 +85,73 @@ describe("persistent assistant audio playback", () => {
     await expect(playback.ended).resolves.toBeUndefined();
     expect(harness.context.close).not.toHaveBeenCalled();
   });
+
+  it("plays through HTML audio when Web Audio is unavailable", async () => {
+    const audio = {
+      pause: vi.fn(),
+      play: vi.fn(async () => undefined),
+      onended: null,
+      onerror: null,
+    };
+    const manager = createAudioPlaybackManager({
+      getContextConstructor: () => null,
+      createAudio: vi.fn(() => audio),
+    });
+
+    const playback = await manager.play("blob:assistant-audio");
+
+    expect(playback.started).toBe(true);
+    expect(audio.play).toHaveBeenCalledTimes(1);
+    audio.onended();
+    await expect(playback.ended).resolves.toBeUndefined();
+  });
+
+  it("handles an autoplay rejection without an unhandled promise", async () => {
+    const audio = {
+      pause: vi.fn(),
+      play: vi.fn(async () => {
+        throw new Error("NotAllowedError");
+      }),
+      onended: null,
+      onerror: null,
+    };
+    const manager = createAudioPlaybackManager({
+      getContextConstructor: () => null,
+      createAudio: vi.fn(() => audio),
+    });
+
+    const playback = await manager.play("blob:assistant-audio");
+
+    expect(playback.started).toBe(false);
+    expect(audio.pause).toHaveBeenCalledTimes(1);
+    await expect(playback.ended).resolves.toBeUndefined();
+  });
+
+  it("stops the previous message before starting another", async () => {
+    const first = {
+      pause: vi.fn(),
+      play: vi.fn(async () => undefined),
+      onended: null,
+      onerror: null,
+    };
+    const second = {
+      pause: vi.fn(),
+      play: vi.fn(async () => undefined),
+      onended: null,
+      onerror: null,
+    };
+    const createAudio = vi.fn()
+      .mockReturnValueOnce(first)
+      .mockReturnValueOnce(second);
+    const manager = createAudioPlaybackManager({
+      getContextConstructor: () => null,
+      createAudio,
+    });
+
+    await manager.play("blob:first");
+    const playback = await manager.play("blob:second");
+
+    expect(first.pause).toHaveBeenCalledTimes(1);
+    expect(playback.started).toBe(true);
+  });
 });

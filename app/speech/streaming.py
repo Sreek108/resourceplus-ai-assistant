@@ -1,6 +1,9 @@
 import asyncio
+import inspect
+import io
 import logging
 import threading
+import wave
 from typing import Any
 
 from app.config import get_settings
@@ -10,9 +13,14 @@ from app.speech.azure_speech import (
     SpeechInputError,
     SpeechRecognitionError,
     SpeechTranscript,
+    RecognitionCandidate,
+    _enable_detailed_output,
+    _apply_phrase_hints,
+    recognize_audio_candidates,
+    speech_result_confidence,
     speechsdk,
 )
-from app.speech.language import resolve_spoken_language
+from app.speech.language import analyze_script
 
 
 logger = logging.getLogger(__name__)
@@ -25,7 +33,12 @@ FINALIZATION_TIMEOUT_SECONDS = 12
 class StreamingSpeechRecognizer:
     """One Azure continuous-recognition session backed by raw PCM push audio."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        established_language: str | None = None,
+        phrase_hints: tuple[str, ...] = (),
+    ) -> None:
         settings = get_settings()
         if speechsdk is None:
             raise SpeechConfigurationError("Azure Speech support is not installed.")
@@ -35,6 +48,10 @@ class StreamingSpeechRecognizer:
         self._settings = settings
         self._segments: list[str] = []
         self._locale: str | None = None
+        self._confidences: list[float] = []
+        self._pcm = bytearray()
+        self._established_language = established_language
+        self._phrase_hints = phrase_hints
         self._error: str | None = None
         self._error_category: str | None = None
         self._stopped = threading.Event()
@@ -51,6 +68,7 @@ class StreamingSpeechRecognizer:
             subscription=settings.azure_speech_key,
             region=settings.azure_speech_region,
         )
+        _enable_detailed_output(speechsdk, speech_config)
         auto_detect = speechsdk.languageconfig.AutoDetectSourceLanguageConfig(
             languages=[
                 settings.azure_speech_en_locale,
@@ -62,6 +80,7 @@ class StreamingSpeechRecognizer:
             auto_detect_source_language_config=auto_detect,
             audio_config=speechsdk.audio.AudioConfig(stream=self._stream),
         )
+        _apply_phrase_hints(speechsdk, self._recognizer, phrase_hints)
         self._recognizer.recognized.connect(self._on_recognized)
         self._recognizer.canceled.connect(self._on_canceled)
         self._recognizer.session_stopped.connect(self._on_stopped)
@@ -81,6 +100,9 @@ class StreamingSpeechRecognizer:
             locale = None
         with self._lock:
             self._segments.append(text)
+            confidence = speech_result_confidence(result, speechsdk)
+            if confidence is not None:
+                self._confidences.append(confidence)
             if locale:
                 self._locale = str(locale)
 
@@ -120,7 +142,17 @@ class StreamingSpeechRecognizer:
                 "The PCM audio chunk is malformed.",
                 safe_category="invalid_stream_state",
             )
+        self._pcm.extend(pcm_chunk)
         self._stream.write(pcm_chunk)
+
+    def _buffered_wav(self) -> bytes:
+        target = io.BytesIO()
+        with wave.open(target, "wb") as audio_file:
+            audio_file.setnchannels(STREAM_CHANNELS)
+            audio_file.setsampwidth(STREAM_BITS_PER_SAMPLE // 8)
+            audio_file.setframerate(STREAM_SAMPLE_RATE)
+            audio_file.writeframes(bytes(self._pcm))
+        return target.getvalue()
 
     async def finish(self) -> SpeechTranscript:
         if not self._started or self._closed:
@@ -152,33 +184,77 @@ class StreamingSpeechRecognizer:
                 "Streaming speech recognition took too long to finalize.",
                 safe_category="stream_finalize_timeout",
             )
-        if self._error:
-            raise SpeechRecognitionError(
-                "Streaming speech recognition is temporarily unavailable.",
-                safe_category=self._error_category or "azure_canceled",
-            )
         with self._lock:
             transcript = " ".join(self._segments).strip()
             locale = self._locale
-        if not transcript:
-            raise SpeechInputError(
-                "No speech could be recognized from the audio.",
-                safe_category="no_recognized_speech",
+            confidence = (
+                sum(self._confidences) / len(self._confidences)
+                if self._confidences else None
             )
-        raw_locale = locale or self._settings.azure_speech_en_locale
-        with measure_stage("language_resolution"):
-            resolution = resolve_spoken_language(
-                transcript,
-                raw_locale,
-                english_locale=self._settings.azure_speech_en_locale,
-                arabic_locale=self._settings.azure_speech_ar_locale,
-            )
-        return SpeechTranscript(
+        raw_locale = locale or "und"
+        auto_candidate = RecognitionCandidate(
             transcript=transcript,
+            locale=raw_locale,
+            confidence=confidence,
+            success=bool(transcript),
+            result_status=(
+                "recognized"
+                if transcript
+                else "cancelled" if self._error else "no_match"
+            ),
+            script_class=(
+                analyze_script(transcript).classification
+                if transcript
+                else "script_neutral"
+            ),
+        )
+        with measure_stage("language_resolution"):
+            candidate_kwargs: dict[str, object] = {
+                "established_language": self._established_language,
+                "auto_candidate": auto_candidate,
+            }
+            parameters = inspect.signature(
+                recognize_audio_candidates
+            ).parameters.values()
+            if any(
+                parameter.name == "phrase_hints"
+                or parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters
+            ):
+                candidate_kwargs["phrase_hints"] = self._phrase_hints
+            recognition = await recognize_audio_candidates(
+                self._buffered_wav(),
+                **candidate_kwargs,
+            )
+        selected = recognition.selected
+        fallback = (
+            recognition.arabic
+            if recognition.primary_locale.casefold().startswith("en")
+            else recognition.english
+        )
+        return SpeechTranscript(
+            transcript=selected.transcript,
             detected_locale=raw_locale,
-            detected_language=resolution.language,
-            resolved_locale=resolution.locale,
-            language_resolution_source=resolution.source,
+            detected_language=selected.language,
+            resolved_locale=selected.locale,
+            language_resolution_source="candidate_recognition",
+            stt_confidence=selected.confidence,
+            stt_primary_locale=recognition.primary_locale,
+            stt_primary_confidence=(
+                recognition.english.confidence
+                if recognition.primary_locale.casefold().startswith("en")
+                and recognition.english is not None
+                else (
+                    recognition.arabic.confidence
+                    if recognition.arabic is not None
+                    else None
+                )
+            ),
+            stt_fallback_used=recognition.fallback_used,
+            stt_fallback_locale=recognition.fallback_locale,
+            stt_fallback_confidence=fallback.confidence if fallback is not None else None,
+            stt_selection_reason=recognition.selection_reason,
+            transcript_script_class=selected.script_class,
         )
 
     async def cancel(self) -> None:

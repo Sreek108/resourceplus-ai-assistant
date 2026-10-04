@@ -4,7 +4,7 @@ from datetime import date
 import pytest
 from fastapi.testclient import TestClient
 
-from app.ai import actions
+from app.ai import actions, conversation
 from app.ai.agent import AgentResult
 from app.ai.sessions import session_store
 from app.ai.tools import execute_tool
@@ -117,7 +117,7 @@ def test_http_voice_buffer_transcript_uses_deterministic_balance(monkeypatch) ->
     assert response.status_code == 200
     assert calls == ["2026-10-01"]
     assert body["transcript"] == "How much buffer time do I have?"
-    assert body["message"] == "You have 120 minutes remaining."
+    assert body["message"] == "You have 120 minutes of buffer time left."
     assert body["tools_used"] == ["get_exceptional_entry_balance"]
 
 
@@ -384,61 +384,40 @@ def test_http_voice_explicit_direction_remains_transaction_eligible(
     expected_direction: str,
 ) -> None:
     session_id = f"voice-direction-{language}-{expected_direction}"
-    reads = {"suggestions": 0, "reasons": 0, "writes": 0}
+    reads = {"attendance": 0, "reasons": 0, "writes": 0}
 
     async def transcribe(*args, **kwargs):
         return SpeechTranscript(transcript, locale, language)
 
-    async def suggestions(*args, **kwargs):
-        reads["suggestions"] += 1
-        return [
-            {
-                "attDate": "29/09/2026",
-                "suggestedEntryTime": (
-                    "29/09/2026 08:00"
-                    if expected_direction == "IN"
-                    else "29/09/2026 17:00"
-                ),
-                "entryType": expected_direction,
-            }
-        ]
+    async def attendance(*args, **kwargs):
+        reads["attendance"] += 1
+        return {"Days": [{
+            "AttDate": "29/09/2026",
+            "DayType": "Regular",
+            "CheckIN": "09:10",
+            "CheckOut": "17:00",
+            "NetHrs": "07:50",
+            "LessHrs": "00:10",
+        }]}
 
     async def reasons(*args, **kwargs):
         reads["reasons"] += 1
         return [{"reasonID": "outside-live-id", "reasonName": "Outside Work"}]
 
+    async def balance(*args, **kwargs):
+        return {"hasPolicy": True, "remaining": 120}
+
     async def no_write(**kwargs):
         reads["writes"] += 1
         raise AssertionError("Preparing a draft must not execute a write")
 
-    async def tool_calling_agent(message, *args, **kwargs):
-        result = await execute_tool(
-            "prepare_exceptional_entry",
-            {
-                "target_date": "2026-09-29",
-                "punch_direction": "OUT" if expected_direction == "IN" else "IN",
-                "reason_name": None,
-                "remarks": None,
-            },
-            lang=2 if language == "ar" else 1,
-            session_id=kwargs["session_id"],
-            response_language=language,
-            source_user_message=message,
-        )
-        return AgentResult(
-            result.terminal_message or json.loads(result.output)["message"],
-            ["prepare_exceptional_entry"] if result.tool_used else [],
-            speech_message=result.terminal_message,
-            needs_reason=result.needs_reason,
-            reason_options=result.reason_options,
-        )
-
     monkeypatch.setattr(voice_module, "transcribe_audio", transcribe)
     monkeypatch.setattr(voice_module, "synthesize_speech", _spoken_audio)
-    monkeypatch.setattr(chat_service, "run_agent", tool_calling_agent)
-    monkeypatch.setattr(actions, "get_missing_punch_suggestions", suggestions)
-    monkeypatch.setattr(actions, "get_exception_reasons", reasons)
-    monkeypatch.setattr(actions, "create_exceptional_entry", no_write)
+    monkeypatch.setattr(conversation, "resourceplus_today", lambda: date(2026, 9, 29))
+    monkeypatch.setattr(actions, "get_attendance_summary", attendance)
+    monkeypatch.setattr(conversation, "cached_exception_reasons", reasons)
+    monkeypatch.setattr(conversation, "get_exceptional_entry_balance", balance)
+    monkeypatch.setattr(actions, "create_exceptional_entry_from_summary", no_write)
 
     response = client.post(
         "/api/voice/chat",
@@ -447,8 +426,13 @@ def test_http_voice_explicit_direction_remains_transaction_eligible(
     )
 
     assert response.status_code == 200
-    draft, pending, _ = _session_state(session_id)
-    assert draft is not None
-    assert draft.entry_type == expected_direction
+    token = bind_request_identity(TEST_IDENTITY)
+    try:
+        draft = session_store.get_conversation_draft(session_id)
+        pending = session_store.get_pending_action(session_id)[0]
+    finally:
+        reset_request_identity(token)
+    assert draft is not None and draft.intent == "less_hours_correction"
+    assert draft.slots["entry_type"] == ("1" if expected_direction == "IN" else "2")
     assert pending is None
-    assert reads == {"suggestions": 1, "reasons": 1, "writes": 0}
+    assert reads == {"attendance": 1, "reasons": 1, "writes": 0}

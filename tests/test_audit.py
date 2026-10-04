@@ -90,7 +90,7 @@ def test_text_turn_creates_one_content_audit_record(monkeypatch, audit_tmp_path)
     assert record["tts_generated"] is None
     assert record["result_status"] == "success"
     assert record["latency_unit"] == "milliseconds"
-    assert record["schema_version"] == 4
+    assert record["schema_version"] == 6
     assert record["latencies_ms"]["agent"] >= 0
 
 
@@ -103,7 +103,19 @@ def test_voice_audit_preserves_exact_display_speech_and_tts(monkeypatch, audit_t
     )
 
     async def transcribe(*args, **kwargs):
-        return SpeechTranscript("Show my attendance", "en-US", "en")
+        return SpeechTranscript(
+            "Show my attendance",
+            "ar-SA",
+            "en",
+            stt_confidence=0.92,
+            stt_primary_locale="en-US",
+            stt_primary_confidence=0.92,
+            stt_fallback_used=True,
+            stt_fallback_locale="ar-SA",
+            stt_fallback_confidence=0.41,
+            stt_selection_reason="primary_outscored_fallback",
+            transcript_script_class="primarily_latin",
+        )
 
     async def process(request, *, detected_language):
         return ChatResponse(
@@ -138,8 +150,20 @@ def test_voice_audit_preserves_exact_display_speech_and_tts(monkeypatch, audit_t
     record = rows[0]
     assert record["user_text"] == "Show my attendance"
     assert record["input_source"] == "stt"
-    assert record["raw_detected_locale"] == "en-US"
+    assert record["raw_detected_locale"] == "ar-SA"
     assert record["resolved_language"] == "en"
+    assert record["language_resolution_source"] == "transcript_latin_script"
+    assert record["short_utterance"] is False
+    assert record["last_confident_language"] == "en"
+    assert record["stt_confidence"] == 0.92
+    assert record["stt_primary_locale"] == "en-US"
+    assert record["stt_primary_confidence"] == 0.92
+    assert record["stt_fallback_used"] is True
+    assert record["stt_fallback_locale"] == "ar-SA"
+    assert record["stt_fallback_confidence"] == 0.41
+    assert record["stt_selection_reason"] == "primary_outscored_fallback"
+    assert record["transcript_script_class"] == "primarily_latin"
+    assert record["response_language_guard_result"] == "passed"
     assert record["response_language"] == "en"
     assert record["display_message"] == "### Attendance\n\n- Monday: **Present**"
     assert record["speech_message"] == "You were present on Monday."

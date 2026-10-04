@@ -91,6 +91,57 @@ def test_voice_chat_runs_transcript_through_shared_agent_and_tts(
     assert calls["tts"] == (message, language)
 
 
+@pytest.mark.parametrize(
+    ("language", "text", "locale", "voice"),
+    [
+        ("en", "Your profile is ready.", "en-US", "en-US-AvaNeural"),
+        ("ar", "ملفك الوظيفي جاهز.", "ar-SA", "ar-SA-ZariyahNeural"),
+    ],
+)
+def test_message_read_aloud_returns_non_empty_language_matched_audio(
+    monkeypatch, language, text, locale, voice
+) -> None:
+    calls = []
+
+    async def synthesize(speech_text, *, language):
+        calls.append((speech_text, language))
+        return SpeechAudio(
+            b"RIFFmessage-audio",
+            mime_type="audio/wav",
+            locale=locale,
+            voice_name=voice,
+        )
+
+    monkeypatch.setattr(voice_module, "synthesize_speech", synthesize)
+    response = client.post(
+        "/api/voice/synthesize",
+        json={"text": text, "language": language},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert base64.b64decode(body["audio_base64"]) == b"RIFFmessage-audio"
+    assert body["audio_mime_type"] == "audio/wav"
+    assert body["language"] == language
+    assert body["tts_locale"] == locale
+    assert body["tts_voice"] == voice
+    assert calls == [(text, language)]
+
+
+def test_message_read_aloud_failure_is_safe_and_does_not_call_hr(monkeypatch) -> None:
+    async def synthesize(*args, **kwargs):
+        raise SpeechSynthesisError("TTS unavailable")
+
+    monkeypatch.setattr(voice_module, "synthesize_speech", synthesize)
+    response = client.post(
+        "/api/voice/synthesize",
+        json={"text": "Your request is pending.", "language": "en"},
+    )
+
+    assert response.status_code == 502
+    assert response.json()["detail"]["code"] == "speech_synthesis_failed"
+
+
 def test_voice_chat_preserves_pending_confirmation_fields(monkeypatch) -> None:
     async def transcribe(*args, **kwargs):
         return SpeechTranscript("Proceed naturally", "en-US", "en")
@@ -264,7 +315,8 @@ def test_voice_chat_preserves_display_markdown_but_synthesizes_clean_text(
     synthesized = {}
 
     async def transcribe(*args, **kwargs):
-        return SpeechTranscript("Show my profile", locale, language)
+        transcript = "أرني ملفي" if language == "ar" else "Show my profile"
+        return SpeechTranscript(transcript, locale, language)
 
     async def process(request, *, detected_language):
         return ChatResponse(
@@ -396,9 +448,14 @@ def test_voice_uses_main_agent_speech_message_in_resolved_language(
 
     async def process(request, *, detected_language):
         assert detected_language == language
+        display = (
+            "### النتيجة التفصيلية\n\n- العنصر الأول\n- العنصر الثاني"
+            if language == "ar"
+            else "### Detailed result\n\n- Item one\n- Item two"
+        )
         return ChatResponse(
             success=True,
-            message="### Detailed result\n\n- Item one\n- Item two",
+            message=display,
             language=language,
             session_id="speech-language-session",
         ).set_speech_message(speech_message)
@@ -417,13 +474,189 @@ def test_voice_uses_main_agent_speech_message_in_resolved_language(
     )
 
     assert response.status_code == 200
-    assert response.json()["message"].startswith("### Detailed result")
+    expected_heading = "### النتيجة التفصيلية" if language == "ar" else "### Detailed result"
+    assert response.json()["message"].startswith(expected_heading)
     assert "speech_message" not in response.json()
     assert calls["tts"] == (speech_message, language)
 
 
 def test_voice_path_has_no_separate_voice_summary_model_dependency() -> None:
     assert not hasattr(voice_module, "render_voice_message")
+
+
+def test_http_voice_short_turn_uses_established_language_for_agent_and_tts(
+    monkeypatch,
+) -> None:
+    recognized = iter(
+        (
+            SpeechTranscript(
+                "Show my attendance",
+                "en-US",
+                "en",
+                language_resolution_source="transcript_latin_script",
+            ),
+            SpeechTranscript(
+                "Yes",
+                "ar-SA",
+                "ar",
+                language_resolution_source="azure_locale_fallback",
+            ),
+        )
+    )
+    agent_languages: list[str] = []
+    tts_languages: list[str] = []
+
+    async def transcribe(*args, **kwargs):
+        return next(recognized)
+
+    async def process(request, *, detected_language):
+        agent_languages.append(detected_language)
+        return ChatResponse(
+            success=True,
+            message="English response",
+            language=detected_language,
+            session_id=request.session_id,
+        ).set_speech_message("English response")
+
+    async def synthesize(text, *, language):
+        tts_languages.append(language)
+        return SpeechAudio(b"audio")
+
+    monkeypatch.setattr(voice_module, "transcribe_audio", transcribe)
+    monkeypatch.setattr(voice_module, "process_chat", process)
+    monkeypatch.setattr(voice_module, "synthesize_speech", synthesize)
+    session_id = "http-language-stability"
+    responses = [
+        client.post(
+            "/api/voice/chat",
+            files={"audio": ("utterance.wav", b"RIFFinput", "audio/wav")},
+            data={"session_id": session_id},
+        )
+        for _ in range(2)
+    ]
+
+    assert [response.json()["detected_language"] for response in responses] == [
+        "en", "en"
+    ]
+    assert agent_languages == ["en", "en"]
+    assert tts_languages == ["en", "en"]
+
+
+@pytest.mark.parametrize(
+    ("session_id", "turns", "expected_languages"),
+    [
+        (
+            "http-switch-en-ar",
+            (
+                SpeechTranscript("Show my attendance", "en-US", "en"),
+                SpeechTranscript("Continue in Arabic", "en-US", "en"),
+                SpeechTranscript("Yes", "en-US", "en"),
+            ),
+            ("en", "ar", "ar"),
+        ),
+        (
+            "http-switch-ar-en",
+            (
+                SpeechTranscript("أرني سجل الحضور", "ar-SA", "ar"),
+                SpeechTranscript("Continue in English", "ar-SA", "ar"),
+                SpeechTranscript("نعم", "ar-SA", "ar"),
+            ),
+            ("ar", "en", "en"),
+        ),
+    ],
+)
+def test_http_voice_explicit_switch_persists_for_following_short_turn(
+    monkeypatch,
+    session_id: str,
+    turns: tuple[SpeechTranscript, ...],
+    expected_languages: tuple[str, ...],
+) -> None:
+    recognized = iter(turns)
+    agent_languages: list[str] = []
+    tts_languages: list[str] = []
+
+    async def transcribe(*args, **kwargs):
+        return next(recognized)
+
+    async def process(request, *, detected_language):
+        agent_languages.append(detected_language)
+        return ChatResponse(
+            success=True,
+            message="Resolved response",
+            language=detected_language,
+            session_id=request.session_id,
+        ).set_speech_message("Resolved response")
+
+    async def synthesize(text, *, language):
+        tts_languages.append(language)
+        return SpeechAudio(b"audio")
+
+    monkeypatch.setattr(voice_module, "transcribe_audio", transcribe)
+    monkeypatch.setattr(voice_module, "process_chat", process)
+    monkeypatch.setattr(voice_module, "synthesize_speech", synthesize)
+    responses = [
+        client.post(
+            "/api/voice/chat",
+            files={"audio": ("utterance.wav", b"RIFFinput", "audio/wav")},
+            data={"session_id": session_id},
+        )
+        for _ in turns
+    ]
+
+    assert [response.json()["detected_language"] for response in responses] == list(
+        expected_languages
+    )
+    assert agent_languages == list(expected_languages)
+    assert tts_languages == list(expected_languages)
+
+
+@pytest.mark.parametrize(
+    ("language", "transcript", "wrong_display", "wrong_speech", "expected_fragment"),
+    [
+        ("en", "Show my profile", "هذا رد عربي.", "هذا رد صوتي عربي.", "safe English response"),
+        ("ar", "أرني ملفي", "This is an English answer.", "English speech.", "ردًا عربيًا"),
+    ],
+)
+def test_voice_response_guard_blocks_model_language_leakage_before_tts(
+    monkeypatch,
+    language: str,
+    transcript: str,
+    wrong_display: str,
+    wrong_speech: str,
+    expected_fragment: str,
+) -> None:
+    synthesized: list[tuple[str, str]] = []
+
+    async def transcribe(*args, **kwargs):
+        locale = "ar-SA" if language == "ar" else "en-US"
+        return SpeechTranscript(transcript, locale, language)
+
+    async def process(request, *, detected_language):
+        return ChatResponse(
+            success=True,
+            message=wrong_display,
+            language=detected_language,
+            session_id=request.session_id,
+        ).set_speech_message(wrong_speech)
+
+    async def synthesize(text, *, language):
+        synthesized.append((text, language))
+        return SpeechAudio(b"guarded-audio")
+
+    monkeypatch.setattr(voice_module, "transcribe_audio", transcribe)
+    monkeypatch.setattr(voice_module, "process_chat", process)
+    monkeypatch.setattr(voice_module, "synthesize_speech", synthesize)
+    response = client.post(
+        "/api/voice/chat",
+        files={"audio": ("utterance.wav", b"RIFFinput", "audio/wav")},
+        data={"session_id": f"guard-{language}"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert expected_fragment in body["message"]
+    assert body["language"] == language
+    assert synthesized == [(body["message"], language)]
 
 
 def test_voice_chat_rejects_empty_audio() -> None:

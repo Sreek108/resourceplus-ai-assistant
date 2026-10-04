@@ -28,8 +28,12 @@ def clear_sessions(monkeypatch) -> None:
     async def classify(*args, **kwargs):
         return "OTHER"
 
+    async def no_day_types(*args, **kwargs):
+        return []
+
     monkeypatch.setattr(chat_service, "render_user_message", render)
     monkeypatch.setattr(chat_service, "classify_confirmation_intent", classify)
+    monkeypatch.setattr(chat_service, "cached_day_types", no_day_types)
 
 
 def seed_pending(arguments: dict[str, object] | None = None):
@@ -67,15 +71,21 @@ async def test_read_only_turn_never_invokes_confirmation_classifier(
     tool_name: str,
 ) -> None:
     store = InMemorySessionStore()
+    model_calls = []
 
     async def classify(*args, **kwargs):
         raise AssertionError("Read-only turns must not invoke confirmation classification")
 
     async def run(*args, **kwargs):
+        model_calls.append((args, kwargs))
         return AgentResult(message="Current ResourcePlus result.", tools_used=[tool_name])
+
+    async def home(*args, **kwargs):
+        return {"EligibleVacation": 8}
 
     monkeypatch.setattr(chat_service, "classify_confirmation_intent", classify)
     monkeypatch.setattr(chat_service, "run_agent", run)
+    monkeypatch.setattr(chat_service, "get_home_data", home)
     trace, token = start_voice_trace()
     try:
         response = await chat_service.process_chat(
@@ -88,7 +98,12 @@ async def test_read_only_turn_never_invokes_confirmation_classifier(
 
     assert response.success is True
     assert response.language == detected_language
-    assert response.tools_used == [tool_name]
+    assert response.tools_used == (
+        ["get_home_data", "get_day_types"]
+        if tool_name == "get_home_data"
+        else [tool_name]
+    )
+    assert len(model_calls) == (0 if tool_name == "get_home_data" else 1)
     assert trace.durations.get("confirmation_classifier", 0.0) == 0.0
 
 
@@ -284,7 +299,7 @@ async def test_english_pending_no_uses_deterministic_english_rejection(
     )
 
     assert response.language == "en"
-    assert response.message == "The pending action was cancelled. Nothing was submitted."
+    assert response.message == "Okay, I won't submit it."
     assert store.get_pending_action(session_id)[0] is None
 
 
@@ -323,7 +338,7 @@ async def test_arabic_pending_short_rejection_keeps_arabic_flow_language(
     )
 
     assert response.language == "ar"
-    assert response.message.startswith("تم إلغاء الإجراء")
+    assert response.message == "حسنًا، ما راح أرسله."
     assert store.get_pending_action(session_id)[0] is None
 
 
@@ -356,7 +371,7 @@ async def test_meaningful_language_switch_changes_acknowledgement_not_safety(
     )
 
     assert response.language == "ar"
-    assert response.message.startswith("تم إلغاء الإجراء")
+    assert response.message == "حسنًا، ما راح أرسله."
 
 
 @pytest.mark.asyncio

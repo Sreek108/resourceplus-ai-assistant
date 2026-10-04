@@ -2,7 +2,13 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 import ChatMessage from "./components/ChatMessage";
-import { audioBase64ToUrl, openVoiceStream, sendChat, sendVoice } from "./lib/api";
+import {
+  audioBase64ToUrl,
+  openVoiceStream,
+  sendChat,
+  sendVoice,
+  synthesizeVoice,
+} from "./lib/api";
 import { isValidWavBlob, startWavRecording } from "./lib/wavRecorder";
 
 vi.mock("./lib/api", () => ({
@@ -10,6 +16,7 @@ vi.mock("./lib/api", () => ({
   sendVoice: vi.fn(),
   openVoiceStream: vi.fn(),
   audioBase64ToUrl: vi.fn(() => "blob:assistant-audio"),
+  synthesizeVoice: vi.fn(),
 }));
 
 vi.mock("./lib/wavRecorder", () => ({
@@ -63,10 +70,18 @@ describe("ResourcePlus demo UI", () => {
     delete globalThis.AudioContext;
     delete globalThis.webkitAudioContext;
     sessionStorage.clear();
+    sessionStorage.setItem("resourceplus.demo.test-user", "talal");
     window.history.replaceState({}, "", "/");
     vi.clearAllMocks();
     isValidWavBlob.mockResolvedValue(true);
     sendChat.mockResolvedValue(response());
+    synthesizeVoice.mockResolvedValue({
+      audio_base64: "UklGRg==",
+      audio_mime_type: "audio/wav",
+      language: "en",
+      tts_locale: "en-US",
+      tts_voice: "en-US-AvaNeural",
+    });
     openVoiceStream.mockRejectedValue(new Error("stream unavailable"));
     sendVoice.mockResolvedValue(
       response({
@@ -181,7 +196,7 @@ describe("ResourcePlus demo UI", () => {
           blocks: [
             {
               type: "table",
-              title: "Less-hours attendance",
+              title: "Attendance gaps",
               columns: [
                 { key: "date", label: "Date" },
                 { key: "action", label: "Action" },
@@ -249,6 +264,64 @@ describe("ResourcePlus demo UI", () => {
     expect(candidateButton.disabled).toBe(true);
   });
 
+  it("sends a structured per-request selector and disables stale row actions", async () => {
+    const selection = { kind: "pending_approval", decision: "approve", ordinal: 1 };
+    sendChat
+      .mockResolvedValueOnce(response({
+        message: "Here are the pending requests.",
+        blocks: [{
+          type: "table",
+          title: "Pending approvals",
+          columns: [
+            { key: "employee", label: "Employee" },
+            { key: "request", label: "Request" },
+            { key: "date", label: "Date" },
+            { key: "detail", label: "Detail" },
+            { key: "status", label: "Status" },
+            { key: "action", label: "Action" },
+          ],
+          rows: [{
+            employee: "Talal Sabbagh",
+            request: "Leave",
+            date: "Oct 9",
+            detail: "Compensatory Leave",
+            status: "Pending",
+            action: "",
+          }],
+          row_actions: [[{
+            label: "Approve",
+            value: "Approve request 1",
+            style: "primary",
+            payload: selection,
+          }, {
+            label: "Reject",
+            value: "Reject request 1",
+            style: "danger",
+            payload: { ...selection, decision: "reject" },
+          }]],
+        }],
+      }))
+      .mockResolvedValueOnce(response({
+        message: "Approve Talal Sabbagh's Compensatory Leave request for Oct 9?",
+        requires_confirmation: true,
+        confirmation_id: "confirmation-one",
+      }));
+
+    render(<App />);
+    await sendTypedMessage("Show pending approvals");
+    const approveButton = await screen.findByRole("button", { name: "Approve" });
+    fireEvent.click(approveButton);
+
+    await waitFor(() => expect(sendChat).toHaveBeenCalledTimes(2));
+    expect(sendChat.mock.calls[1][0]).toMatchObject({
+      message: "Approve request 1",
+      approvalSelection: selection,
+      sessionId: "session-new",
+    });
+    expect(approveButton.disabled).toBe(true);
+    expect(document.body.textContent).not.toContain("requestId");
+  });
+
   it("keeps Arabic assistant Markdown RTL", () => {
     render(
       <ChatMessage
@@ -286,6 +359,8 @@ describe("ResourcePlus demo UI", () => {
     expect(sendChat).toHaveBeenCalledWith({
       message: "Hello",
       sessionId: "session-existing",
+      email: "talal.sabbagh@example.com",
+      instance: "portalv21",
       confirmationId: "",
     });
   });
@@ -297,6 +372,139 @@ describe("ResourcePlus demo UI", () => {
 
     expect(await screen.findByText("Here is your information.")).toBeTruthy();
     expect(globalThis.Audio).not.toHaveBeenCalled();
+  });
+
+  it("reads an English text response aloud and caches it for replay", async () => {
+    sendChat.mockResolvedValueOnce(response({
+      message: "Your profile is ready.",
+      language: "en",
+    }));
+    render(<App />);
+    await sendTypedMessage("Show my profile");
+
+    fireEvent.click(await screen.findByLabelText("Read assistant message aloud"));
+
+    await waitFor(() => expect(synthesizeVoice).toHaveBeenCalledWith({
+      text: "Your profile is ready.",
+      language: "en",
+    }));
+    expect(audioBase64ToUrl).toHaveBeenCalledWith("UklGRg==", "audio/wav");
+    await waitFor(() => expect(globalThis.Audio).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(await screen.findByLabelText("Replay assistant voice response"));
+    await waitFor(() => expect(globalThis.Audio).toHaveBeenCalledTimes(2));
+    expect(synthesizeVoice).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses Arabic synthesis metadata for an Arabic text response", async () => {
+    const arabicMessage = "طلبك لا يزال قيد الانتظار.";
+    sendChat.mockResolvedValueOnce(response({
+      message: arabicMessage,
+      language: "ar",
+    }));
+    synthesizeVoice.mockResolvedValueOnce({
+      audio_base64: "UklGRg==",
+      audio_mime_type: "audio/wav",
+      language: "ar",
+      tts_locale: "ar-SA",
+      tts_voice: "ar-SA-ZariyahNeural",
+    });
+    render(<App />);
+    await sendTypedMessage("اعرض طلباتي");
+
+    fireEvent.click(await screen.findByLabelText("Read assistant message aloud"));
+
+    await waitFor(() => expect(synthesizeVoice).toHaveBeenCalledWith({
+      text: arabicMessage,
+      language: "ar",
+    }));
+    expect(audioBase64ToUrl).toHaveBeenCalledWith("UklGRg==", "audio/wav");
+    await waitFor(() => expect(globalThis.Audio).toHaveBeenCalledTimes(1));
+  });
+
+  it("keeps text usable and offers retry when message synthesis fails", async () => {
+    synthesizeVoice.mockRejectedValueOnce(new Error("Voice audio is unavailable right now."));
+    render(<App />);
+    await sendTypedMessage("Show my profile");
+
+    fireEvent.click(await screen.findByLabelText("Read assistant message aloud"));
+
+    expect(await screen.findByText("Voice audio is unavailable right now.")).toBeTruthy();
+    expect(screen.getByText("Here is your information.")).toBeTruthy();
+    expect(screen.getByLabelText("Read assistant message aloud")).toBeTruthy();
+    expect(globalThis.Audio).not.toHaveBeenCalled();
+  });
+
+  it("does not crash or play when message synthesis returns empty audio", async () => {
+    synthesizeVoice.mockResolvedValueOnce({
+      audio_base64: "",
+      audio_mime_type: "audio/wav",
+      language: "en",
+      tts_locale: "en-US",
+      tts_voice: "en-US-AvaNeural",
+    });
+    render(<App />);
+    await sendTypedMessage("Show my profile");
+
+    fireEvent.click(await screen.findByLabelText("Read assistant message aloud"));
+
+    expect(await screen.findByText("Voice audio is unavailable for this message.")).toBeTruthy();
+    expect(screen.getByText("Here is your information.")).toBeTruthy();
+    expect(audioBase64ToUrl).not.toHaveBeenCalled();
+    expect(globalThis.Audio).not.toHaveBeenCalled();
+  });
+
+  it("does not play a stale synthesis result after starting a new conversation", async () => {
+    let resolveSynthesis;
+    synthesizeVoice.mockReturnValueOnce(new Promise((resolve) => {
+      resolveSynthesis = resolve;
+    }));
+    render(<App />);
+    await sendTypedMessage("Show my profile");
+    fireEvent.click(await screen.findByLabelText("Read assistant message aloud"));
+    await waitFor(() => expect(synthesizeVoice).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(screen.getByLabelText("Start a new conversation"));
+    await act(async () => {
+      resolveSynthesis({
+        audio_base64: "UklGRg==",
+        audio_mime_type: "audio/wav",
+        language: "en",
+        tts_locale: "en-US",
+        tts_voice: "en-US-AvaNeural",
+      });
+    });
+
+    expect(audioBase64ToUrl).not.toHaveBeenCalled();
+    expect(globalThis.Audio).not.toHaveBeenCalled();
+  });
+
+  it("stops one message before reading a different message", async () => {
+    sendChat
+      .mockResolvedValueOnce(response({ message: "First response." }))
+      .mockResolvedValueOnce(response({ message: "Second response." }));
+    let firstAudio;
+    globalThis.Audio.mockImplementationOnce(function ActiveAudio() {
+      firstAudio = {
+        pause: vi.fn(),
+        play: vi.fn(() => Promise.resolve()),
+        onended: null,
+        onerror: null,
+      };
+      return firstAudio;
+    });
+    render(<App />);
+    await sendTypedMessage("First question");
+    await sendTypedMessage("Second question");
+    const readButtons = await screen.findAllByLabelText("Read assistant message aloud");
+
+    fireEvent.click(readButtons[0]);
+    await waitFor(() => expect(globalThis.Audio).toHaveBeenCalledTimes(1));
+    fireEvent.click(readButtons[1]);
+
+    await waitFor(() => expect(firstAudio.pause).toHaveBeenCalled());
+    await waitFor(() => expect(globalThis.Audio).toHaveBeenCalledTimes(2));
+    expect(synthesizeVoice).toHaveBeenCalledTimes(2);
   });
 
   it("unlocks a persistent AudioContext from the microphone gesture", async () => {
@@ -369,7 +577,12 @@ describe("ResourcePlus demo UI", () => {
 
     await waitFor(() => expect(screen.getByText("أرني تنبيهاتي")).toBeTruthy());
     expect(sendVoice).toHaveBeenCalledWith(
-      expect.objectContaining({ sessionId: "", confirmationId: "" }),
+      expect.objectContaining({
+        sessionId: expect.any(String),
+        confirmationId: "",
+        email: "talal.sabbagh@example.com",
+        instance: "portalv21",
+      }),
     );
     expect(audioBase64ToUrl).toHaveBeenCalledWith("UklGRg==", "audio/wav");
     expect(globalThis.Audio).toHaveBeenCalledWith("blob:assistant-audio");
@@ -536,7 +749,8 @@ describe("ResourcePlus demo UI", () => {
     expect(screen.getByText("Allowance")).toBeTruthy();
     expect(screen.getByRole("button", { name: "Review correction" })).toBeTruthy();
     expect(screen.getByRole("heading", { name: "ResourcePlus" })).toBeTruthy();
-    expect(screen.getByText("Action requires confirmation")).toBeTruthy();
+    expect(screen.getByText("Confirmation required")).toBeTruthy();
+    expect(screen.getByText("Confirm the correction.")).toBeTruthy();
     expect(screen.getByRole("button", { name: "Confirm" })).toBeTruthy();
     expect(await screen.findByText(
       "Voice audio is unavailable right now. The response is shown as text.",
@@ -557,6 +771,8 @@ describe("ResourcePlus demo UI", () => {
     expect(sendChat).toHaveBeenLastCalledWith({
       message: "No",
       sessionId: "tts-confirmation-session",
+      email: "talal.sabbagh@example.com",
+      instance: "portalv21",
       confirmationId: "tts-confirmation-id",
     });
     expect(sendVoice).toHaveBeenCalledTimes(1);
@@ -831,7 +1047,7 @@ describe("ResourcePlus demo UI", () => {
     });
   });
 
-  it("does not show a service outage when autoplay is blocked", async () => {
+  it("offers manual playback when autoplay is blocked", async () => {
     globalThis.Audio.mockImplementationOnce(function BlockedAudio() {
       return {
         pause: vi.fn(),
@@ -843,9 +1059,14 @@ describe("ResourcePlus demo UI", () => {
     render(<App />);
     await holdAndRelease();
 
-    await waitFor(() => expect(screen.getByLabelText("Replay assistant voice response")).toBeTruthy());
+    const replay = await screen.findByLabelText("Replay assistant voice response");
+    expect(await screen.findByText(
+      "Audio didn’t autoplay. Use the speaker button to play it.",
+    )).toBeTruthy();
     expect(screen.queryByRole("alert")).toBeNull();
     expect(document.body.textContent).not.toContain("Voice is temporarily unavailable");
+    fireEvent.click(replay);
+    await waitFor(() => expect(globalThis.Audio).toHaveBeenCalledTimes(2));
   });
 
   it("shows a classified voice backend failure while keeping typing available", async () => {
@@ -931,6 +1152,8 @@ describe("ResourcePlus demo UI", () => {
     expect(sendChat).toHaveBeenLastCalledWith({
       message: "Yes",
       sessionId: "session-new",
+      email: "talal.sabbagh@example.com",
+      instance: "portalv21",
       confirmationId: "confirmation-456",
     });
   });
@@ -972,6 +1195,8 @@ describe("ResourcePlus demo UI", () => {
     expect(sendChat).toHaveBeenLastCalledWith({
       message: "Embassy Purposes",
       sessionId: "session-new",
+      email: "talal.sabbagh@example.com",
+      instance: "portalv21",
       confirmationId: "",
     });
     expect(await screen.findByText(/Selected reason: Embassy Purposes/)).toBeTruthy();
@@ -1018,7 +1243,8 @@ describe("ResourcePlus demo UI", () => {
 
     fireEvent.click(screen.getByLabelText("Start a new conversation"));
     await waitFor(() => expect(screen.getByText("How can I help you today?")).toBeTruthy());
-    expect(sessionStorage.getItem("resourceplus.demo.session")).toBeNull();
+    expect(sessionStorage.getItem("resourceplus.demo.session")).toEqual(expect.any(String));
+    expect(sessionStorage.getItem("resourceplus.demo.session")).not.toBe("session-existing");
     expect(screen.queryByText("Old message")).toBeNull();
   });
 
@@ -1081,8 +1307,124 @@ describe("ResourcePlus demo UI", () => {
     await waitFor(() => expect(sendChat).toHaveBeenCalledTimes(1));
     expect(sendChat).toHaveBeenCalledWith({
       message: "Show my notifications",
-      sessionId: "",
+      sessionId: expect.any(String),
+      email: "talal.sabbagh@example.com",
+      instance: "portalv21",
       confirmationId: "",
     });
+  });
+
+  it("offers both explicit demo identities and sends Talal identity", async () => {
+    render(<App />);
+
+    const selector = screen.getByLabelText("Test User");
+    expect(selector.value).toBe("talal");
+    expect(screen.getByRole("option", { name: "Talal Sabbagh - Employee" })).toBeTruthy();
+    expect(screen.getByRole("option", { name: "Hana Haddad - HOD" })).toBeTruthy();
+    expect(screen.getByText("talal.sabbagh@example.com")).toBeTruthy();
+
+    await sendTypedMessage("Show my profile");
+    expect(sendChat).toHaveBeenLastCalledWith(expect.objectContaining({
+      email: "talal.sabbagh@example.com",
+      instance: "portalv21",
+    }));
+  });
+
+  it("switches users with fresh isolated sessions and clears old messages", async () => {
+    render(<App />);
+    const selector = screen.getByLabelText("Test User");
+    const talalSession = sessionStorage.getItem("resourceplus.demo.session");
+    await sendTypedMessage("Talal message");
+    expect(await screen.findByText("Talal message")).toBeTruthy();
+
+    fireEvent.change(selector, { target: { value: "hana" } });
+    await waitFor(() => expect(selector.value).toBe("hana"));
+    const hanaSession = sessionStorage.getItem("resourceplus.demo.session");
+    expect(hanaSession).not.toBe(talalSession);
+    expect(screen.queryByText("Talal message")).toBeNull();
+    expect(screen.getByText("hana.haddad@example.com")).toBeTruthy();
+
+    await sendTypedMessage("Hana message");
+    expect(sendChat).toHaveBeenLastCalledWith(expect.objectContaining({
+      sessionId: hanaSession,
+      email: "hana.haddad@example.com",
+      instance: "portalv21",
+    }));
+
+    fireEvent.change(selector, { target: { value: "talal" } });
+    await waitFor(() => expect(selector.value).toBe("talal"));
+    const newTalalSession = sessionStorage.getItem("resourceplus.demo.session");
+    expect(newTalalSession).not.toBe(hanaSession);
+    expect(newTalalSession).not.toBe(talalSession);
+    expect(screen.queryByText("Hana message")).toBeNull();
+  });
+
+  it("starts a fresh session without changing the selected user", async () => {
+    render(<App />);
+    const selector = screen.getByLabelText("Test User");
+    fireEvent.change(selector, { target: { value: "hana" } });
+    await waitFor(() => expect(selector.value).toBe("hana"));
+    await sendTypedMessage("Keep Hana selected");
+    await waitFor(() => expect(screen.getByText("Here is your information.")).toBeTruthy());
+    const previousSession = sessionStorage.getItem("resourceplus.demo.session");
+
+    fireEvent.click(screen.getByRole("button", { name: "Start New Session" }));
+
+    await waitFor(() => expect(screen.getByText("How can I help you today?")).toBeTruthy());
+    expect(selector.value).toBe("hana");
+    expect(screen.getByText("hana.haddad@example.com")).toBeTruthy();
+    expect(sessionStorage.getItem("resourceplus.demo.session")).not.toBe(previousSession);
+    expect(screen.queryByText("Keep Hana selected")).toBeNull();
+  });
+
+  it("uses the selected identity in the voice WebSocket START source", async () => {
+    render(<App />);
+    fireEvent.change(screen.getByLabelText("Test User"), { target: { value: "hana" } });
+    const selectedSession = sessionStorage.getItem("resourceplus.demo.session");
+
+    fireEvent.pointerDown(screen.getByLabelText("Hold to talk"), {
+      pointerId: 31,
+      pointerType: "mouse",
+      button: 0,
+      buttons: 1,
+    });
+
+    await waitFor(() => expect(openVoiceStream).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionId: selectedSession,
+        email: "hana.haddad@example.com",
+        instance: "portalv21",
+      }),
+    ));
+    fireEvent.pointerCancel(screen.getByLabelText("Release to send voice message"), {
+      pointerId: 31,
+      pointerType: "mouse",
+    });
+  });
+
+  it("cancels active voice resources when the test user changes", async () => {
+    const streamController = {
+      sendChunk: vi.fn(),
+      finish: vi.fn(),
+      cancel: vi.fn(),
+    };
+    const recorder = { stop: vi.fn(), cancel: vi.fn().mockResolvedValue(undefined) };
+    openVoiceStream.mockResolvedValueOnce(streamController);
+    startWavRecording.mockResolvedValueOnce(recorder);
+    render(<App />);
+
+    fireEvent.pointerDown(screen.getByLabelText("Hold to talk"), {
+      pointerId: 32,
+      pointerType: "touch",
+      buttons: 1,
+    });
+    await waitFor(() => expect(startWavRecording).toHaveBeenCalledTimes(1));
+
+    fireEvent.change(screen.getByLabelText("Test User"), { target: { value: "hana" } });
+
+    await waitFor(() => expect(recorder.cancel).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(streamController.cancel).toHaveBeenCalledTimes(1));
+    expect(sendVoice).not.toHaveBeenCalled();
+    expect(screen.getByLabelText("Test User").value).toBe("hana");
   });
 });

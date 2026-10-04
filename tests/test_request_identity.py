@@ -8,6 +8,7 @@ from dataclasses import FrozenInstanceError
 import pytest
 from fastapi.testclient import TestClient
 
+from app import identity as identity_module
 from app.ai.agent import AgentResult
 from app.ai.sessions import InMemorySessionStore, SessionIdentityMismatch, session_store
 from app.ai.tools import TOOL_DEFINITIONS
@@ -22,8 +23,17 @@ from app.identity import (
 )
 from app.main import app
 from app.models.schemas import ChatRequest, ChatResponse
-from app.resourceplus.attendance import get_attendance_summary
+from app.resourceplus import exceptional as exceptional_module
+from app.resourceplus.approvals import get_pending_approvals
+from app.resourceplus.attendance import (
+    get_attendance_summary,
+    get_exception_reasons,
+    get_missing_punch_suggestions,
+)
 from app.resourceplus.employee import get_profile_data
+from app.resourceplus.exceptional import get_exceptional_entry_balance
+from app.resourceplus.leave import get_my_day_type_requests
+from app.resourceplus.requests import get_exceptional_entry_requests
 from app.services import chat as chat_service
 from app.speech import SpeechAudio, SpeechTranscript
 
@@ -43,10 +53,21 @@ def identity_scope(email: str, instance: str):
 class RecordingResourcePlusClient:
     def __init__(self) -> None:
         self.gets: list[tuple[str, dict[str, object]]] = []
+        self.posts: list[tuple[str, dict[str, object], dict[str, object]]] = []
 
     async def get(self, path: str, *, params: dict[str, object]):
         self.gets.append((path, params))
         return {"ok": True}
+
+    async def post(
+        self,
+        path: str,
+        *,
+        params: dict[str, object],
+        json_body: dict[str, object],
+    ):
+        self.posts.append((path, params, json_body))
+        return {"success": True, "isAutoApproved": False}
 
 
 def test_text_request_binds_supplied_identity(monkeypatch) -> None:
@@ -97,6 +118,108 @@ async def test_profile_and_attendance_use_bound_request_identity() -> None:
         "toDate": "2026-09-30",
         "instanceName": "Client02",
         "lang": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_all_deterministic_reads_use_explicit_portal_instance() -> None:
+    resourceplus = RecordingResourcePlusClient()
+
+    with identity_scope("talal.sabbagh@example.com", "portalv21"):
+        await get_profile_data(client=resourceplus)
+        await get_attendance_summary("2026-09-01", "2026-09-30", client=resourceplus)
+        await get_missing_punch_suggestions(
+            "2026-09-01", "2026-09-30", client=resourceplus
+        )
+        await get_exceptional_entry_balance("2026-09-14", client=resourceplus)
+        await get_exception_reasons(client=resourceplus)
+        await get_exceptional_entry_requests(
+            "2026-09-01", "2026-09-30", client=resourceplus
+        )
+        await get_my_day_type_requests(
+            "2026-09-01", "2026-09-30", client=resourceplus
+        )
+        await get_pending_approvals(client=resourceplus)
+
+    assert [path for path, _ in resourceplus.gets] == [
+        "api/Client/GetProfileData",
+        "api/AI/AttendanceSummary",
+        "api/AI/MissingPunchSuggestions",
+        "api/AI/ExceptionalEntries/Balance",
+        "api/AI/ExceptionalEntries/Reasons",
+        "api/AI/ExceptionalEntries",
+        "api/AI/DayTypeMapping/MyRequests",
+        "api/AI/Supervisor/PendingApprovals",
+    ]
+    assert all(
+        params["instanceName"] == "portalv21"
+        for _, params in resourceplus.gets
+    )
+
+
+@pytest.mark.asyncio
+async def test_confirmed_from_summary_uses_pending_owner_not_default_instance(
+    monkeypatch,
+) -> None:
+    class LocalSettings:
+        app_environment = "local"
+        rp_default_email = "fallback@example.com"
+        rp_instance = "Universal"
+
+    class ContextDroppingStore(InMemorySessionStore):
+        def consume_pending_action(self, session_id, confirmation_id=None):
+            action = super().consume_pending_action(session_id, confirmation_id)
+            # Reproduce the observed execution seam: the ambient request identity
+            # is unavailable after the immutable action has been authorized.
+            monkeypatch.setattr("app.identity.get_settings", lambda: LocalSettings())
+            identity_module._request_identity.set(None)
+            return action
+
+    resourceplus = RecordingResourcePlusClient()
+    monkeypatch.setattr(
+        exceptional_module,
+        "ResourcePlusClient",
+        lambda: resourceplus,
+    )
+    store = ContextDroppingStore()
+    owner = RequestIdentity("talal.sabbagh@example.com", "portalv21")
+    with identity_scope(owner.email, owner.instance):
+        session_id = store.ensure_session("talal-from-summary")
+        pending = store.create_pending_action(
+            session_id,
+            action_type="create_exceptional_entry_from_summary",
+            validated_arguments={
+                "att_date": "2026-09-14",
+                "reason_id": "live-reason-id",
+                "reason_name": "Family Circumstances",
+                "remarks": "Family Circumstances",
+                "less_hours": "00:30",
+            },
+            summary="Submit attendance correction?",
+            language="en",
+        )
+
+    request = ChatRequest(
+        message="Yes",
+        session_id=session_id,
+        confirmation_id=pending.confirmation_id,
+        email=owner.email,
+        instance=owner.instance,
+    )
+    response = await chat_service.process_chat(request, store=store)
+    replay = await chat_service.process_chat(request, store=store)
+
+    assert response.success is True
+    assert replay.success is False
+    assert len(resourceplus.posts) == 1
+    path, params, body = resourceplus.posts[0]
+    assert path == "api/AI/ExceptionalEntries/FromSummary"
+    assert params == {"instanceName": "portalv21"}
+    assert body == {
+        "usrEmail": "talal.sabbagh@example.com",
+        "attDate": "2026-09-14",
+        "reasonID": "live-reason-id",
+        "remarks": "Family Circumstances",
     }
 
 
@@ -267,8 +390,8 @@ async def test_same_session_with_different_identity_is_rejected(
 @pytest.mark.parametrize(
     "confirmer",
     [
-        RequestIdentity("manager@example.com", "Universal"),
-        RequestIdentity("employee@example.com", "Client02"),
+        RequestIdentity("talal.sabbagh@example.com", "Universal"),
+        RequestIdentity("other.employee@example.com", "portalv21"),
     ],
 )
 async def test_pending_action_cannot_be_confirmed_by_another_identity(
@@ -276,7 +399,7 @@ async def test_pending_action_cannot_be_confirmed_by_another_identity(
     confirmer: RequestIdentity,
 ) -> None:
     store = InMemorySessionStore()
-    with identity_scope("employee@example.com", "Universal"):
+    with identity_scope("talal.sabbagh@example.com", "portalv21"):
         session_id = store.ensure_session("pending-owner-session")
         action = store.create_pending_action(
             session_id,
@@ -311,7 +434,7 @@ async def test_pending_action_cannot_be_confirmed_by_another_identity(
 
     assert response.success is False
     assert writes == []
-    with identity_scope("employee@example.com", "Universal"):
+    with identity_scope("talal.sabbagh@example.com", "portalv21"):
         remaining, expired = store.get_pending_action(session_id)
     assert expired is False
     assert remaining is not None

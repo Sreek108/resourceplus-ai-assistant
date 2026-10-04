@@ -3,20 +3,24 @@ import ChatMessage from "./components/ChatMessage";
 import Composer from "./components/Composer";
 import Header from "./components/Header";
 import Sidebar from "./components/Sidebar";
+import TestUserPanel from "./components/TestUserPanel";
 import Welcome from "./components/Welcome";
+import { DEFAULT_TEST_USER, findTestUser } from "./demoUsers";
 import { createAudioPlaybackManager } from "./lib/audioPlayback";
-import { audioBase64ToUrl, openVoiceStream, sendChat, sendVoice } from "./lib/api";
+import {
+  audioBase64ToUrl,
+  openVoiceStream,
+  sendChat,
+  sendVoice,
+  synthesizeVoice,
+} from "./lib/api";
 import { messageLanguage } from "./lib/language";
 import { isValidWavBlob, startWavRecording } from "./lib/wavRecorder";
 
 const SESSION_KEY = "resourceplus.demo.session";
 const CONFIRMATION_KEY = "resourceplus.demo.confirmation";
 const MESSAGES_KEY = "resourceplus.demo.messages";
-const DEMO_EMAIL = (import.meta.env.VITE_RP_EMAIL || "").trim();
-const DEMO_INSTANCE = (import.meta.env.VITE_RP_INSTANCE || "").trim();
-const DEMO_IDENTITY = DEMO_EMAIL || DEMO_INSTANCE
-  ? { email: DEMO_EMAIL, instance: DEMO_INSTANCE }
-  : {};
+const TEST_USER_KEY = "resourceplus.demo.test-user";
 const MIN_RECORDING_MS = 600;
 const MIN_WAV_BYTES = 1_000;
 const NO_SPEECH_CODES = new Set(["no_speech", "no_audio", "no_recognized_speech"]);
@@ -36,14 +40,28 @@ function loadMessages() {
   }
 }
 
+function initialDemoState() {
+  const storedUserId = sessionStorage.getItem(TEST_USER_KEY);
+  const selectedUser = findTestUser(storedUserId);
+  const hasKnownStoredUser = Boolean(storedUserId && selectedUser.id === storedUserId);
+  return {
+    selectedUserId: selectedUser.id,
+    sessionId: hasKnownStoredUser
+      ? sessionStorage.getItem(SESSION_KEY) || uniqueId()
+      : uniqueId(),
+    confirmationId: hasKnownStoredUser
+      ? sessionStorage.getItem(CONFIRMATION_KEY) || ""
+      : "",
+    messages: hasKnownStoredUser ? loadMessages() : [],
+  };
+}
+
 export default function App() {
-  const [messages, setMessages] = useState(loadMessages);
-  const [sessionId, setSessionId] = useState(
-    () => sessionStorage.getItem(SESSION_KEY) || "",
-  );
-  const [confirmationId, setConfirmationId] = useState(
-    () => sessionStorage.getItem(CONFIRMATION_KEY) || "",
-  );
+  const [initialState] = useState(initialDemoState);
+  const [selectedUserId, setSelectedUserId] = useState(initialState.selectedUserId);
+  const [messages, setMessages] = useState(initialState.messages);
+  const [sessionId, setSessionId] = useState(initialState.sessionId);
+  const [confirmationId, setConfirmationId] = useState(initialState.confirmationId);
   const [input, setInput] = useState("");
   const [status, setStatus] = useState("idle");
   const [recordingSeconds, setRecordingSeconds] = useState(0);
@@ -61,6 +79,7 @@ export default function App() {
   const playbackManagerRef = useRef(null);
   const playbackTokenRef = useRef(0);
   const reasonSelectionRef = useRef(false);
+  const identityEpochRef = useRef(0);
   const chatScrollRef = useRef(null);
   const audioUrlsRef = useRef(new Set());
   const voiceProgressRef = useRef({ transcript: "", assistantId: "" });
@@ -68,10 +87,15 @@ export default function App() {
     () => new URLSearchParams(window.location.search).get("debug") === "true",
     [],
   );
+  const selectedUser = useMemo(() => findTestUser(selectedUserId), [selectedUserId]);
   const busy = ["sending", "listening", "processing", "speaking"].includes(status);
   if (!playbackManagerRef.current) {
     playbackManagerRef.current = createAudioPlaybackManager();
   }
+
+  useEffect(() => {
+    sessionStorage.setItem(TEST_USER_KEY, selectedUserId);
+  }, [selectedUserId]);
 
   useEffect(() => {
     const serializable = messages.map(({ audioUrl, ...message }) => message);
@@ -191,7 +215,10 @@ export default function App() {
             .map(({ label, value }) => ({ label, value }))
         : [],
       blocks: structuredBlocks,
-      actionsActive: structuredBlocks.some((block) => block?.type === "actions"),
+      actionsActive: structuredBlocks.some((block) => (
+        block?.type === "actions"
+        || (block?.type === "table" && block.row_actions?.some((actions) => actions?.length))
+      )),
       ...extras,
       debug: {
         detected_language: extras.detectedLanguage || response.language,
@@ -218,7 +245,12 @@ export default function App() {
     ]);
   }
 
-  async function submitText(textOverride, confirmationOverride, visibleTextOverride) {
+  async function submitText(
+    textOverride,
+    confirmationOverride,
+    visibleTextOverride,
+    approvalSelectionOverride,
+  ) {
     const text = (textOverride ?? input).trim();
     const visibleText = (visibleTextOverride ?? text).trim();
     if (!text || busy) return false;
@@ -226,6 +258,7 @@ export default function App() {
     setError("");
     setNotice("");
     setStatus("sending");
+    const identityEpoch = identityEpochRef.current;
     const userMessage = {
       id: uniqueId(),
       role: "user",
@@ -241,12 +274,18 @@ export default function App() {
       userMessage,
     ]);
     try {
-      const response = await sendChat({
+      const chatPayload = {
         message: text,
         sessionId,
-        ...DEMO_IDENTITY,
+        email: selectedUser.email,
+        instance: selectedUser.instance,
         confirmationId: confirmationOverride ?? confirmationId,
-      });
+      };
+      if (approvalSelectionOverride) {
+        chatPayload.approvalSelection = approvalSelectionOverride;
+      }
+      const response = await sendChat(chatPayload);
+      if (identityEpochRef.current !== identityEpoch) return false;
       applySession(response);
       setMessages((current) => [
         ...current.map((message) => ({ ...message, requiresConfirmation: false })),
@@ -254,10 +293,11 @@ export default function App() {
       ]);
       return true;
     } catch (requestError) {
+      if (identityEpochRef.current !== identityEpoch) return false;
       setError(requestError.message || "Could not send your message. Please try again.");
       return false;
     } finally {
-      setStatus("idle");
+      if (identityEpochRef.current === identityEpoch) setStatus("idle");
     }
   }
 
@@ -271,7 +311,12 @@ export default function App() {
     setMessages((current) => current.map((message) => (
       message.id === messageId ? { ...message, actionsActive: false } : message
     )));
-    return submitText(action.value, undefined, action.label);
+    return submitText(
+      action.value,
+      undefined,
+      action.label,
+      action.payload?.kind === "pending_approval" ? action.payload : undefined,
+    );
   }
 
   async function submitReason(messageId, value) {
@@ -328,7 +373,8 @@ export default function App() {
       voiceStreamErrorRef.current = null;
       voiceStreamPromiseRef.current = openVoiceStream({
         sessionId,
-        ...DEMO_IDENTITY,
+        email: selectedUser.email,
+        instance: selectedUser.instance,
         confirmationId,
         debug,
         onEvent(event) {
@@ -420,6 +466,7 @@ export default function App() {
     }
 
     voiceSubmissionRef.current = true;
+    const voiceAttempt = voiceAttemptRef.current;
     setStatus("processing");
     setError("");
     setNotice("");
@@ -453,7 +500,8 @@ export default function App() {
           response = await sendVoice({
             audio,
             sessionId,
-            ...DEMO_IDENTITY,
+            email: selectedUser.email,
+            instance: selectedUser.instance,
             confirmationId,
           });
         }
@@ -465,10 +513,12 @@ export default function App() {
         response = await sendVoice({
           audio,
           sessionId,
-          ...DEMO_IDENTITY,
+          email: selectedUser.email,
+          instance: selectedUser.instance,
           confirmationId,
         });
       }
+      if (voiceAttemptRef.current !== voiceAttempt) return;
       applySession(response);
       if (response.tts_unavailable) {
         setNotice(
@@ -525,10 +575,12 @@ export default function App() {
         setError(voiceError.message || "The voice message could not be processed.");
       }
     } finally {
-      cleanupVoiceResources({ resetStatus: false });
-      if (failed) setStatus("error");
-      else if (!playbackStarted) setStatus("idle");
-      setRecordingSeconds(0);
+      if (voiceAttemptRef.current === voiceAttempt) {
+        cleanupVoiceResources({ resetStatus: false });
+        if (failed) setStatus("error");
+        else if (!playbackStarted) setStatus("idle");
+        setRecordingSeconds(0);
+      }
     }
   }
 
@@ -537,61 +589,124 @@ export default function App() {
     cleanupVoiceResources();
   }
 
-  async function playAudio(url, { automatic = false } = {}) {
-    const playbackToken = playbackTokenRef.current + 1;
-    playbackTokenRef.current = playbackToken;
+  async function playAudio(url, { automatic = false, playbackToken } = {}) {
+    const activeToken = playbackToken ?? playbackTokenRef.current + 1;
+    playbackTokenRef.current = activeToken;
     const playback = await playbackManagerRef.current.play(url, {
       userGesture: !automatic,
     });
-    if (playbackTokenRef.current !== playbackToken) {
+    if (playbackTokenRef.current !== activeToken) {
       playback.stop();
       return false;
     }
     if (!playback.started) {
       setStatus("idle");
-      if (!automatic) setNotice("Audio playback couldn’t start. Please try again.");
+      setNotice(
+        automatic
+          ? "Audio didn’t autoplay. Use the speaker button to play it."
+          : "Audio playback couldn’t start. Please try again.",
+      );
       return false;
     }
     setStatus("speaking");
     void playback.ended.then(() => {
-      if (playbackTokenRef.current === playbackToken) setStatus("idle");
+      if (playbackTokenRef.current === activeToken) setStatus("idle");
     });
     return true;
   }
 
-  function replayAudio(url) {
-    setNotice("");
-    void playAudio(url);
+  async function playMessageAudio(message, playbackToken, identityEpoch) {
+    let url = message.audioUrl;
+    try {
+      if (!url) {
+        const synthesis = await synthesizeVoice({
+          text: message.text,
+          language: message.language || messageLanguage(message.text),
+        });
+        if (
+          playbackTokenRef.current !== playbackToken
+          || identityEpochRef.current !== identityEpoch
+        ) return;
+        if (!synthesis?.audio_base64) {
+          throw new Error("Voice audio is unavailable for this message.");
+        }
+        url = audioBase64ToUrl(
+          synthesis.audio_base64,
+          synthesis.audio_mime_type || "audio/wav",
+        );
+        audioUrlsRef.current.add(url);
+        setMessages((current) => current.map((item) => (
+          item.id === message.id ? { ...item, audioUrl: url } : item
+        )));
+      }
+      if (
+        playbackTokenRef.current !== playbackToken
+        || identityEpochRef.current !== identityEpoch
+      ) return;
+      await playAudio(url, { playbackToken });
+    } catch (playbackError) {
+      if (
+        playbackTokenRef.current === playbackToken
+        && identityEpochRef.current === identityEpoch
+      ) {
+        setStatus("idle");
+        setNotice(playbackError.message || "Voice audio is unavailable right now.");
+      }
+    }
   }
 
-  function newConversation() {
+  function replayAudio(message) {
+    setNotice("");
+    const playbackToken = playbackTokenRef.current + 1;
+    playbackTokenRef.current = playbackToken;
+    playbackManagerRef.current.stop();
+    // Unlock synchronously from the click gesture before any network await.
+    void playbackManagerRef.current.unlock();
+    void playMessageAudio(message, playbackToken, identityEpochRef.current);
+  }
+
+  function resetConversation() {
+    identityEpochRef.current += 1;
     cleanupVoiceResources({ resetStatus: false });
     playbackTokenRef.current += 1;
     playbackManagerRef.current.stop();
     for (const url of audioUrlsRef.current) URL.revokeObjectURL(url);
     audioUrlsRef.current.clear();
     reasonSelectionRef.current = false;
+    const freshSessionId = uniqueId();
     setMessages([]);
-    setSessionId("");
+    setSessionId(freshSessionId);
     setConfirmationId("");
     setInput("");
     setError("");
     setNotice("");
     setStatus("idle");
-    sessionStorage.removeItem(SESSION_KEY);
+    sessionStorage.setItem(SESSION_KEY, freshSessionId);
     sessionStorage.removeItem(CONFIRMATION_KEY);
     sessionStorage.removeItem(MESSAGES_KEY);
+  }
+
+  function switchTestUser(userId) {
+    if (userId === selectedUserId) return;
+    setSelectedUserId(findTestUser(userId).id);
+    sessionStorage.setItem(TEST_USER_KEY, findTestUser(userId).id);
+    resetConversation();
   }
 
   return (
     <div className="app-shell">
       <Header
-        onNewConversation={newConversation}
+        onNewConversation={resetConversation}
         disabled={["sending", "processing"].includes(status)}
       />
       <div className="workspace">
         <Sidebar onShortcut={(text) => submitText(text)} disabled={busy} />
         <main className="chat-panel">
+          <TestUserPanel
+            selectedUser={selectedUser || DEFAULT_TEST_USER}
+            onChange={switchTestUser}
+            onNewSession={resetConversation}
+          />
           <div
             ref={chatScrollRef}
             className="chat-scroll"

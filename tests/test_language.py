@@ -24,7 +24,7 @@ def test_confirmation_fast_paths_are_not_an_arabic_phrase_map() -> None:
 
 
 @pytest.mark.asyncio
-async def test_arabic_natural_language_reaches_same_agent(monkeypatch) -> None:
+async def test_arabic_leave_balance_uses_deterministic_localized_path(monkeypatch) -> None:
     calls = []
 
     async def classify(*args, **kwargs):
@@ -34,17 +34,24 @@ async def test_arabic_natural_language_reaches_same_agent(monkeypatch) -> None:
         calls.append((message, lang, history, response_language))
         return AgentResult(message="لديك رصيد إجازة متاح.", tools_used=["get_home_data"])
 
+    async def day_types(*args, **kwargs):
+        return []
+
+    async def home(*args, **kwargs):
+        return {"EligibleVacation": 8}
+
     monkeypatch.setattr(chat_service, "classify_confirmation_intent", classify)
     monkeypatch.setattr(chat_service, "run_agent", run)
+    monkeypatch.setattr(chat_service, "cached_day_types", day_types)
+    monkeypatch.setattr(chat_service, "get_home_data", home)
     response = await chat_service.process_chat(
         ChatRequest(message="وش باقي لي من الإجازات؟"),
         store=InMemorySessionStore(),
     )
 
-    assert calls[0][0] == "وش باقي لي من الإجازات؟"
-    assert calls[0][3] == "ar"
+    assert calls == []
     assert response.language == "ar"
-    assert response.tools_used == ["get_home_data"]
+    assert response.tools_used == ["get_home_data", "get_day_types"]
 
 
 @pytest.mark.asyncio

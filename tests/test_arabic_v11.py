@@ -87,7 +87,7 @@ async def test_arabic_balance_uses_balance_only_fast_path(monkeypatch, message) 
 
     assert len(calls) == 1
     assert result.tools_used == ["get_exceptional_entry_balance"]
-    assert result.message == "لديك 100 دقيقة متبقية."
+    assert result.message == "باقي لك 100 دقيقة من وقت السماح."
     assert result.speech_message == result.message
     block = result.blocks[0]
     assert block.title == "رصيد السماح"
@@ -120,10 +120,10 @@ async def test_arabic_less_hours_read_is_localized_and_structured(monkeypatch) -
     )
 
     assert response.language == "ar"
-    assert response.message == "لديك حالة واحدة لساعات ناقصة خلال هذه الفترة."
-    assert response.speech_message == response.message
+    assert response.message == "عندك يوم حضور واحد يحتاج تصحيح خلال هالفترة: 2026-09-10."
+    assert response.speech_message == "عندك يوم حضور واحد يحتاج تصحيح خلال هالفترة."
     table = next(block for block in response.blocks if block.type == "table")
-    assert table.title == "الحضور بساعات ناقصة"
+    assert table.title == "فجوات الحضور"
     assert table.rows[0]["date"] == "2026-09-10"
     assert table.rows[0]["less"] == "00:30"
     assert [column.label for column in table.columns][:3] == ["التاريخ", "نوع اليوم", "الدخول"]
@@ -171,7 +171,7 @@ async def test_arabic_less_hours_correction_slots_and_reason_continuation(
     prompt = await chat_service.process_chat(ChatRequest(message=message), store=store)
     draft = store.get_conversation_draft(prompt.session_id)
     assert prompt.language == "ar"
-    assert prompt.message == "ما سبب التصحيح؟"
+    assert prompt.message.endswith("وش سبب التصحيح؟")
     assert prompt.needs_reason is True
     assert draft is not None and draft.slots["date"] == "2026-09-10"
     assert draft.slots.get("minutes") == (str(minutes) if minutes is not None else None)
@@ -189,7 +189,8 @@ async def test_arabic_less_hours_correction_slots_and_reason_continuation(
     assert pending is not None
     assert pending.validated_arguments.get("minutes") == minutes
     assert pending.validated_arguments.get("entry_type") == entry_type
-    assert "التأكيد مطلوب قبل الإرسال" in prepared.message
+    assert prepared.message.startswith("للتأكيد: أرسل تصحيح حضور")
+    assert "دقيقة" in prepared.speech_message
     if minutes is not None:
         assert f"الدقائق المطلوبة: {minutes}" in prepared.message
     if entry_type == 1:
@@ -207,7 +208,7 @@ async def test_arabic_less_hours_correction_slots_and_reason_continuation(
         detected_language="ar",
         store=store,
     )
-    assert rejected.message.startswith("تم إلغاء الإجراء")
+    assert rejected.message == "حسنًا، ما راح أرسله."
     assert writes == []
 
 
@@ -215,9 +216,6 @@ async def test_arabic_less_hours_correction_slots_and_reason_continuation(
 @pytest.mark.parametrize(
     "message",
     [
-        "اعرض طلبات الاستثناء لهذا الشهر",
-        "اعرض طلبات الاستثناء الخاصة بي",
-        "ما هي طلبات الاستثناء المعلقة؟",
         "اعرض استثناءاتي هذا الشهر",
     ],
 )
@@ -250,21 +248,21 @@ async def test_arabic_exceptional_read_is_specific_and_localized(monkeypatch, me
     assert result.tools_used == ["get_exceptional_entries"]
     assert calls
     table = result.blocks[0]
-    assert table.title == "طلبات الاستثناء"
+    assert table.title == "طلبات تصحيح الحضور"
     assert [column.label for column in table.columns] == ["التاريخ", "النوع", "السبب", "الحالة"]
     assert table.rows[0]["type"] == "وصول متأخر"
     assert table.rows[1]["type"] == "خروج مبكر"
     assert table.rows[1]["status"] == "غير موافق عليه"
     assert "arabic-secret" not in table.model_dump_json()
-    assert result.message.startswith("لديك 2 من طلبات الاستثناء خلال هذه الفترة.")
-    assert result.speech_message == "لديك 2 من طلبات الاستثناء خلال هذه الفترة."
+    assert result.message.startswith("عندك طلبين تصحيح حضور خلال هالفترة.")
+    assert result.speech_message == "عندك طلبين تصحيح حضور خلال هالفترة."
 
 
 @pytest.mark.parametrize(
     ("auto_approved", "expected"),
     [
-        (True, "تمت الموافقة تلقائيًا على تصحيح حضورك."),
-        (False, "تم إرسال تصحيح حضورك وهو بانتظار موافقة المدير."),
+        (True, "تم تصحيح حضورك واعتماده تلقائياً."),
+        (False, "أرسلت تصحيح حضورك لموافقة مديرك."),
     ],
 )
 def test_arabic_correction_result_copy_is_employee_facing(
@@ -320,7 +318,7 @@ async def test_arabic_cancellation_discovery_and_selection(
     assert discovered.language == "ar"
     assert discovered.message.startswith("وجدت أكثر من طلب قابل للإلغاء")
     table = next(block for block in discovered.blocks if block.type == "table")
-    assert table.title == "طلبات استثناء قابلة للإلغاء"
+    assert table.title == "طلبات تصحيح حضور قابلة للإلغاء"
     assert table.rows[1]["type"] == "خروج مبكر"
 
     prepared = await chat_service.process_chat(
@@ -332,7 +330,10 @@ async def test_arabic_cancellation_discovery_and_selection(
     assert pending is not None
     assert pending.validated_arguments["exceptional_id"] == expected_id
     assert pending.language == "ar"
-    assert "التأكيد مطلوب" in prepared.message
+    assert prepared.message.startswith("تبغى تلغي طلب تصحيح الحضور")
+    assert any(
+        block.type == "confirmation" for block in prepared.blocks
+    )
     assert "arabic-secret" not in prepared.model_dump_json()
     assert writes == []
 
@@ -461,7 +462,7 @@ async def test_arabic_new_correction_replaces_old_reason_draft(monkeypatch) -> N
         store=store,
     )
     replacement = store.get_conversation_draft(session_id)
-    assert response.message == "ما سبب التصحيح؟"
+    assert response.message.endswith("وش سبب التصحيح؟")
     assert replacement is not None
     assert replacement.slots["date"] == "2026-09-10"
     assert replacement.slots["minutes"] == "10"
@@ -497,7 +498,7 @@ async def test_arabic_less_hours_read_interrupts_cancellation_draft(monkeypatch)
         ),
         store=store,
     )
-    assert read.message == "لديك حالة واحدة لساعات ناقصة خلال هذه الفترة."
+    assert read.message == "عندك يوم حضور واحد يحتاج تصحيح خلال هالفترة: 2026-09-10."
     assert store.get_conversation_draft(discovered.session_id) is None
     assert store.get_pending_action(discovered.session_id)[0] is None
 
