@@ -6,6 +6,7 @@ import {
   resolveApiBaseUrl,
   sendChat,
   sendVoice,
+  synthesizeVoice,
 } from "./api";
 
 describe("same-origin production configuration", () => {
@@ -59,6 +60,31 @@ describe("voice response audio", () => {
     expect(decodedBlob).toBeInstanceOf(Blob);
     expect(decodedBlob.type).toBe("audio/wav");
     expect(decodedBlob.size).toBe(4);
+  });
+
+  it("requests read-aloud audio with the exact message language", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        audio_base64: "AQIDBA==",
+        audio_mime_type: "audio/wav",
+        language: "ar",
+        tts_locale: "ar-SA",
+        tts_voice: "ar-SA-ZariyahNeural",
+      }),
+    });
+
+    const response = await synthesizeVoice({ text: "طلبك معلق.", language: "ar" });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringMatching(/\/api\/voice\/synthesize$/),
+      {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "طلبك معلق.", language: "ar" }),
+      },
+    );
+    expect(response.tts_locale).toBe("ar-SA");
   });
 });
 
@@ -193,6 +219,27 @@ describe("demo identity transport", () => {
     });
     expect(requests[1].options.body.get("email")).toBe("employee@example.com");
     expect(requests[1].options.body.get("instance")).toBe("Universal");
+  });
+
+  it("transports an approval selector without a ResourcePlus request ID", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ success: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    const approvalSelection = {
+      kind: "pending_approval",
+      decision: "reject",
+      ordinal: 2,
+    };
+
+    await sendChat({ message: "Reject request 2", approvalSelection });
+
+    const body = JSON.parse(fetchSpy.mock.calls[0][1].body);
+    expect(body.approval_selection).toEqual(approvalSelection);
+    expect(body).not.toHaveProperty("requestId");
+    expect(JSON.stringify(body)).not.toContain("rp-secret-id");
   });
 
   it.each([

@@ -67,7 +67,7 @@ def test_chat_generates_and_returns_session_id(monkeypatch) -> None:
     monkeypatch.setattr(chat_service, "run_agent", run_agent)
     response = client.post("/api/chat", json={"message": "Hello"})
     assert response.status_code == 200
-    assert response.json()["message"] == "Hello!"
+    assert response.json()["message"] == "Hi! What can I help you with?"
     assert response.json()["session_id"]
     assert response.json()["requires_confirmation"] is False
 
@@ -78,7 +78,7 @@ def test_chat_returns_safe_live_reason_options_without_ids(monkeypatch) -> None:
     async def run_agent(message, *, lang, session_id, history, response_language):
         return AgentResult(
             message="What was the reason?",
-            tools_used=["prepare_exceptional_entry"],
+            tools_used=["prepare_less_hours_correction"],
             needs_reason=True,
             reason_options=["Embassy Purposes", "Family Circumstances"],
         )
@@ -86,7 +86,7 @@ def test_chat_returns_safe_live_reason_options_without_ids(monkeypatch) -> None:
     monkeypatch.setattr(chat_service, "run_agent", run_agent)
     response = client.post(
         "/api/chat",
-        json={"message": "Correct my less hours on September 1"},
+        json={"message": "Please help me with this HR item"},
     )
 
     assert response.status_code == 200

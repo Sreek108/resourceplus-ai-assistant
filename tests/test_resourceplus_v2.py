@@ -7,6 +7,7 @@ import pytest
 
 from app.ai import actions
 from app.ai import conversation
+from app.ai.agent import MODEL_TOOL_DEFINITIONS
 from app.ai.actions import (
     ActionResolutionRequired,
     execute_pending_action,
@@ -25,7 +26,7 @@ from app.ai.sessions import InMemorySessionStore
 from app.audit import SAFE_ACTION_TYPES
 from app.identity import RequestIdentity, bind_request_identity, reset_request_identity
 from app.models.schemas import ChatRequest
-from app.resourceplus.client import ResourcePlusClient
+from app.resourceplus.client import ResourcePlusClient, ResourcePlusHTTPError
 from app.resourceplus.exceptional import (
     cancel_exceptional_entry,
     create_exceptional_entry_from_summary,
@@ -58,6 +59,12 @@ def attendance_row(
         "NetHrs": "07:43",
         "LessHrs": less,
     }
+
+
+def test_model_tool_surface_excludes_legacy_raw_exception_request() -> None:
+    names = {tool["name"] for tool in MODEL_TOOL_DEFINITIONS}
+    assert "prepare_exceptional_entry" not in names
+    assert "prepare_less_hours_correction" in names
 
 
 @pytest.mark.asyncio
@@ -130,6 +137,57 @@ async def test_from_summary_wrapper_optional_fields_are_explicit_only(
 
 
 @pytest.mark.asyncio
+async def test_from_summary_observed_request_shape_and_safe_http_500_diagnostic() -> None:
+    captured: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(
+            500,
+            json={
+                "errorCode": "RP-INTERNAL-500",
+                "message": "The correction could not be processed.",
+                "private": "employee@example.com bearer private-token",
+            },
+        )
+
+    client = ResourcePlusClient(
+        base_url="https://example.test/Mobile/",
+        transport=httpx.MockTransport(handler),
+    )
+    identity_token = bind_request_identity(
+        RequestIdentity(email="employee@example.com", instance="Universal")
+    )
+    try:
+        with pytest.raises(ResourcePlusHTTPError) as raised:
+            await create_exceptional_entry_from_summary(
+                "2026-09-10",
+                "live-family-reason-id",
+                "Family Circumstances",
+                client=client,
+            )
+    finally:
+        reset_request_identity(identity_token)
+
+    assert len(captured) == 1  # An HTTP 500 must not retry a write.
+    request = captured[0]
+    assert request.method == "POST"
+    assert request.url.path == "/Mobile/api/AI/ExceptionalEntries/FromSummary"
+    assert dict(request.url.params) == {"instanceName": "Universal"}
+    assert request.headers["content-type"] == "application/json"
+    assert __import__("json").loads(request.content) == {
+        "usrEmail": "employee@example.com",
+        "attDate": "2026-09-10",
+        "reasonID": "live-family-reason-id",
+        "remarks": "Family Circumstances",
+    }
+    assert raised.value.status_code == 500
+    assert raised.value.diagnostic.code == "RP-INTERNAL-500"
+    assert raised.value.diagnostic.message == "The correction could not be processed."
+    assert "private-token" not in str(raised.value)
+
+
+@pytest.mark.asyncio
 async def test_cancel_wrapper_uses_identity_and_resolved_id() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/Mobile/api/AI/ExceptionalEntries/Cancel"
@@ -173,6 +231,69 @@ async def test_authoritative_attendance_classification(monkeypatch, row, expecte
     inspection = await inspect_less_hours_period("2026-09-29", "2026-09-29", lang=1)
     assert inspection.days[0].eligibility == expected
     assert bool(inspection.eligible_days) is (expected == "eligible")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("raw_status", "classification", "message_fragment", "table_status"),
+    [
+        ("Approved", "approved", "already covered by an approved attendance correction", "Approved exception"),
+        (
+            "Not Approved",
+            "ambiguous_not_approved",
+            "already a correction request",
+            "Existing request",
+        ),
+    ],
+)
+async def test_existing_exceptional_entry_suppresses_duplicate_less_hours_action(
+    monkeypatch,
+    raw_status,
+    classification,
+    message_fragment,
+    table_status,
+) -> None:
+    async def summary(*args, **kwargs):
+        return {"Days": [attendance_row(att_date="2026-09-24")]}
+
+    async def exceptional(*args, **kwargs):
+        return [
+            {
+                "exceptionalID": "backend-id",
+                "entryTime": "2026-09-24 12:00:00",
+                "entryType": 1,
+                "reason": "Work From Home",
+                "status": raw_status,
+            }
+        ]
+
+    monkeypatch.setattr(actions, "get_attendance_summary", summary)
+    monkeypatch.setattr(actions, "get_exceptional_entry_requests", exceptional)
+
+    inspection = await inspect_less_hours_period(
+        "2026-09-24",
+        "2026-09-24",
+        lang=1,
+    )
+
+    assert inspection.eligible_days == ()
+    assert inspection.duplicate_guards[0].raw_status == raw_status
+    assert inspection.duplicate_guards[0].classification == classification
+
+    async def inspected(*args, **kwargs):
+        return inspection
+    monkeypatch.setattr(conversation, "inspect_less_hours_period", inspected)
+    response = await chat_service.process_chat(
+        ChatRequest(message="Correct my less hours on September 24"),
+        store=InMemorySessionStore(),
+    )
+
+    assert message_fragment in response.message
+    assert response.requires_confirmation is False
+    assert not any(block.type == "actions" for block in response.blocks)
+    assert response.blocks[0].rows[0]["action"] == table_status
+    if raw_status == "Not Approved":
+        assert "does not tell us whether it is pending or rejected" in response.message
 
 
 @pytest.mark.asyncio
@@ -246,6 +367,172 @@ async def test_ineligible_day_never_prepares_from_summary(monkeypatch, row) -> N
             lang=1,
             response_language="en",
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("message", "expected_date", "expected_entry_type"),
+    [
+        ("book exceptional entry for 01 sep IN punch", "2026-09-01", 1),
+        ("create exceptional entry for 1 September", "2026-09-01", None),
+        ("correct my IN punch on 1 Sep", "2026-09-01", 1),
+        ("fix my OUT punch yesterday", "2026-09-30", 2),
+        ("I forgot to punch in on 1 Sep", "2026-09-01", 1),
+    ],
+)
+async def test_missing_punch_language_prepares_v2_from_summary_deterministically(
+    monkeypatch,
+    message,
+    expected_date,
+    expected_entry_type,
+) -> None:
+    store = InMemorySessionStore()
+    attendance_reads = []
+
+    async def summary(start, end, **kwargs):
+        attendance_reads.append((start, end))
+        return {"Days": [attendance_row(att_date=expected_date)]}
+
+    async def reasons(*args, **kwargs):
+        return [{"reasonID": "live-guid", "reasonName": "Traffic"}]
+
+    async def balance(*args, **kwargs):
+        return {"hasPolicy": True, "remaining": 120}
+
+    async def forbidden_legacy(*args, **kwargs):
+        raise AssertionError("normal v2 corrections must not use the legacy Request flow")
+
+    async def forbidden_model(*args, **kwargs):
+        raise AssertionError("supported correction language must not call the model")
+
+    monkeypatch.setattr(conversation, "resourceplus_today", lambda: date(2026, 10, 1))
+    monkeypatch.setattr(actions, "get_attendance_summary", summary)
+    monkeypatch.setattr(actions, "get_exception_reasons", reasons)
+    monkeypatch.setattr(actions, "get_missing_punch_suggestions", forbidden_legacy)
+    monkeypatch.setattr(actions, "create_exceptional_entry", forbidden_legacy)
+    monkeypatch.setattr(conversation, "cached_exception_reasons", reasons)
+    monkeypatch.setattr(conversation, "get_exceptional_entry_balance", balance)
+    monkeypatch.setattr(chat_service, "run_agent", forbidden_model)
+
+    prompt = await chat_service.process_chat(ChatRequest(message=message), store=store)
+    assert prompt.needs_reason is True
+    assert attendance_reads == [(expected_date, expected_date)]
+
+    prepared = await chat_service.process_chat(
+        ChatRequest(message="Traffic", session_id=prompt.session_id),
+        store=store,
+    )
+    pending, _ = store.get_pending_action(prompt.session_id)
+    assert prepared.requires_confirmation is True
+    assert pending is not None
+    assert pending.action_type == "create_exceptional_entry_from_summary"
+    assert pending.validated_arguments["att_date"] == expected_date
+    assert pending.validated_arguments.get("entry_type") == expected_entry_type
+    assert "minutes" not in pending.validated_arguments
+    assert pending.validated_arguments["reason_id"] == "live-guid"
+
+
+@pytest.mark.asyncio
+async def test_absent_no_punch_day_never_prepares_or_posts_exception(monkeypatch) -> None:
+    store = InMemorySessionStore()
+    writes = []
+
+    async def summary(*args, **kwargs):
+        return {"Days": [attendance_row(
+            att_date="2026-09-01",
+            day_type="Absent",
+            check_in=None,
+            check_out=None,
+            less="00:00",
+        )]}
+
+    async def forbidden_reference(*args, **kwargs):
+        raise AssertionError("an ineligible day must not fetch reasons or balance")
+
+    async def forbidden_write(*args, **kwargs):
+        writes.append((args, kwargs))
+
+    monkeypatch.setattr(conversation, "resourceplus_today", lambda: date(2026, 10, 1))
+    monkeypatch.setattr(actions, "get_attendance_summary", summary)
+    monkeypatch.setattr(conversation, "cached_exception_reasons", forbidden_reference)
+    monkeypatch.setattr(conversation, "get_exceptional_entry_balance", forbidden_reference)
+    monkeypatch.setattr(actions, "create_exceptional_entry", forbidden_write)
+    monkeypatch.setattr(actions, "create_exceptional_entry_from_summary", forbidden_write)
+
+    response = await chat_service.process_chat(
+        ChatRequest(message="book exceptional entry for 01 sep IN punch"),
+        store=store,
+    )
+    pending, _ = store.get_pending_action(response.session_id)
+    assert pending is None
+    assert writes == []
+    assert "don't see any attendance punches" in response.message
+    assert "Leave or Business Travel" in response.message
+    draft = store.get_conversation_draft(response.session_id)
+    assert draft is not None and draft.intent == "book_day_type"
+    assert draft.slots["date_from"] == "2026-09-01"
+
+
+@pytest.mark.asyncio
+async def test_confirmation_revalidation_blocks_changed_attendance(monkeypatch) -> None:
+    store = InMemorySessionStore()
+    changed = False
+    writes = []
+
+    async def summary(*args, **kwargs):
+        if changed:
+            return {"Days": [attendance_row(
+                att_date="2026-09-01",
+                day_type="Absent",
+                check_in=None,
+                check_out=None,
+                less="00:00",
+            )]}
+        return {"Days": [attendance_row(att_date="2026-09-01")]}
+
+    async def reasons(*args, **kwargs):
+        return [{"reasonID": "live-guid", "reasonName": "Traffic"}]
+
+    async def balance(*args, **kwargs):
+        return {"hasPolicy": True, "remaining": 120}
+
+    async def submit(**kwargs):
+        writes.append(kwargs)
+
+    monkeypatch.setattr(conversation, "resourceplus_today", lambda: date(2026, 10, 1))
+    monkeypatch.setattr(actions, "get_attendance_summary", summary)
+    monkeypatch.setattr(actions, "get_exception_reasons", reasons)
+    monkeypatch.setattr(conversation, "cached_exception_reasons", reasons)
+    monkeypatch.setattr(conversation, "get_exceptional_entry_balance", balance)
+    monkeypatch.setattr(actions, "create_exceptional_entry_from_summary", submit)
+
+    prompt = await chat_service.process_chat(
+        ChatRequest(message="correct my IN punch on 1 Sep"), store=store
+    )
+    prepared = await chat_service.process_chat(
+        ChatRequest(message="Traffic", session_id=prompt.session_id), store=store
+    )
+    changed = True
+    rejected = await chat_service.process_chat(
+        ChatRequest(
+            message="Yes",
+            session_id=prepared.session_id,
+            confirmation_id=prepared.confirmation_id,
+        ),
+        store=store,
+    )
+    replay = await chat_service.process_chat(
+        ChatRequest(
+            message="Yes",
+            session_id=prepared.session_id,
+            confirmation_id=prepared.confirmation_id,
+        ),
+        store=store,
+    )
+    assert rejected.success is False
+    assert "attendance changed" in rejected.message
+    assert writes == []
+    assert replay.success is False
 
 
 @pytest.mark.parametrize(
@@ -434,7 +721,7 @@ def test_balance_block_never_invents_policy(has_policy) -> None:
 @pytest.mark.parametrize(
     ("limit_type", "expected_unit"),
     [
-        (1, "Exception count"),
+        (1, "Correction count"),
         (2, "Minutes"),
         (3, None),
         (None, None),
@@ -467,8 +754,118 @@ def test_less_hours_block_has_v2_columns() -> None:
     assert [column.label for column in block.columns] == [
         "Date", "Day Type", "Check In", "Check Out", "Worked Hours", "Less Hours", "Action"
     ]
-    assert block.rows[0]["action"] == "Correction candidate"
+    assert block.rows[0]["action"] == "Correction available"
     assert "Eligible" not in markdown_table(block)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "less_hours",
+        "eligibility",
+        "guard_status",
+        "guard_classification",
+        "expected_status",
+        "correction_exposed",
+    ),
+    [
+        pytest.param(
+            "00:17", "eligible", None, None,
+            "Correction available", True,
+            id="positive-less-hours-no-existing-request",
+        ),
+        pytest.param(
+            "00:17", "eligible", "Approved", "approved",
+            "Approved exception", False,
+            id="positive-less-hours-approved",
+        ),
+        pytest.param(
+            "00:17", "eligible", "Not Approved", "ambiguous_not_approved",
+            "Existing request", False,
+            id="positive-less-hours-not-approved",
+        ),
+        pytest.param(
+            "00:00", "no_missing_hours", None, None,
+            "No missing hours", False,
+            id="zero-less-hours",
+        ),
+    ],
+)
+async def test_less_hours_table_and_actions_share_resolved_per_date_state(
+    monkeypatch,
+    less_hours,
+    eligibility,
+    guard_status,
+    guard_classification,
+    expected_status,
+    correction_exposed,
+) -> None:
+    attendance_date = date(2026, 9, 24)
+    day = actions.LessHoursDay(
+        attendance_date,
+        "Present",
+        "09:17",
+        "17:00",
+        "07:43",
+        less_hours,
+        eligibility,
+        {},
+    )
+    guards = (
+        (
+            actions.ExceptionalEntryGuard(
+                attendance_date,
+                guard_status,
+                guard_classification,
+            ),
+        )
+        if guard_status is not None
+        else ()
+    )
+    inspection = actions.LessHoursInspection(
+        (day,),
+        (day,) if correction_exposed else (),
+        duplicate_guards=guards,
+    )
+
+    async def inspect(*args, **kwargs):
+        return inspection
+
+    async def balance(*args, **kwargs):
+        return {"hasPolicy": False}
+
+    monkeypatch.setattr(conversation, "inspect_less_hours_period", inspect)
+    monkeypatch.setattr(conversation, "get_exceptional_entry_balance", balance)
+
+    response = await chat_service.process_chat(
+        ChatRequest(message="Show my less hours on 2026-09-24"),
+        store=InMemorySessionStore(),
+    )
+
+    table = next(block for block in response.blocks if block.type == "table")
+    action_labels = [
+        action.label
+        for block in response.blocks
+        if block.type == "actions"
+        for action in block.actions
+    ]
+    expected_action = "Correct 2026-09-24"
+
+    assert table.rows[0]["action"] == expected_status
+    assert (expected_action in action_labels) is correction_exposed
+    assert (table.rows[0]["action"] == "Correction available") is (
+        expected_action in action_labels
+    )
+    assert "ResourcePlus already has" not in response.message
+    if correction_exposed:
+        assert "1 September attendance gap left to fix" in response.message
+    else:
+        expected_copy = {
+            "Approved exception": "covered by an approved attendance correction",
+            "Existing request": "already a correction request for that day",
+            "No missing hours": "Nothing needs to be fixed",
+        }
+        assert expected_copy[expected_status] in response.message
 
 
 def test_attendance_blocks_map_realistic_resourceplus_v2_rows() -> None:
@@ -655,14 +1052,15 @@ async def test_confirmation_executes_from_summary_once_and_surfaces_result(
     assert response.success is True
     assert len(writes) == 1
     expected_lead = (
-        "Your attendance correction was auto-approved."
+        "Done — your attendance correction was approved automatically."
         if auto_approved
-        else "Your attendance correction was submitted and is waiting for manager approval."
+        else "I've sent your attendance correction to your manager for approval."
     )
     assert response.message.startswith(expected_lead)
-    assert response.speech_message == response.message
+    assert response.speech_message == expected_lead
     assert "ResourcePlus" not in response.message
-    assert "Your allowance was updated." in response.message
+    assert "Your allowance was updated." not in response.message
+    assert response.blocks[0].message == expected_lead
     assert "Warning: Check the split." in response.message
     assert "103" in response.message and "2026-10-05" in response.message
     assert [block.type for block in response.blocks] == ["notice", "notice", "table"]
@@ -731,7 +1129,7 @@ async def test_documented_from_summary_failure_wins_and_surfaces_message_warning
     )
     assert response.success is False
     assert response.message.startswith(
-        "Your attendance correction could not be completed."
+        "I couldn't complete that attendance correction."
     )
     assert "Missing time is more than 4 hours. Apply leave instead." in response.message
     assert "Warning: No entry was created." in response.message
@@ -826,15 +1224,13 @@ async def test_less_hours_reads_create_no_write_preparation_state(
 
     assert response.needs_reason is False
     assert response.requires_confirmation is False
-    assert response.message == (
-        "You have 1 less-hours entry eligible for correction during this period."
-    )
-    assert response.speech_message == response.message
+    assert response.message.startswith("You have 1 September attendance gap left to fix")
+    assert response.speech_message == "You have 1 September attendance gap left to fix."
     assert pending is None
     assert store.get_conversation_draft(response.session_id) is None
     assert [block.type for block in response.blocks] == ["table", "key_value", "actions"]
     assert response.blocks[0].rows[0]["less"] == "00:17"
-    assert response.blocks[0].rows[0]["action"] == "Correction candidate"
+    assert response.blocks[0].rows[0]["action"] == "Correction available"
     assert response.blocks[2].actions[0].value.startswith("Correct my less hours")
     assert balance_dates == ["2026-09-29"]
 
@@ -863,12 +1259,13 @@ async def test_less_hours_read_with_zero_candidates_skips_balance_reasons_and_st
     )
     pending, _ = store.get_pending_action(response.session_id)
 
-    assert response.tools_used == ["get_attendance_summary"]
-    assert response.message == (
-        "You have no less-hours entries eligible for correction during this period."
-    )
+    assert response.tools_used == [
+        "get_attendance_summary",
+        "get_exceptional_entry_requests",
+    ]
+    assert response.message == "Your attendance for that day is complete. Nothing needs to be fixed."
     assert response.speech_message == response.message
-    assert response.blocks[0].rows == []
+    assert response.blocks[0].rows[0]["action"] == "No missing hours"
     assert store.get_conversation_draft(response.session_id) is None
     assert pending is None
 
@@ -896,10 +1293,13 @@ async def test_less_hours_read_with_multiple_candidates_omits_generic_balance(
         store=store,
     )
 
-    assert response.tools_used == ["get_attendance_summary"]
+    assert response.tools_used == [
+        "get_attendance_summary",
+        "get_exceptional_entry_requests",
+    ]
     assert [block.type for block in response.blocks] == ["table", "actions"]
     assert len(response.blocks[0].rows) == 2
-    assert all(row["action"] == "Correction candidate" for row in response.blocks[0].rows)
+    assert all(row["action"] == "Correction available" for row in response.blocks[0].rows)
 
 
 @pytest.mark.asyncio
@@ -1012,7 +1412,10 @@ async def test_multiple_candidate_dates_ask_for_selection_without_balance(monkey
     assert response.blocks[0].type == "table"
     assert len(response.blocks[0].rows) == 2
     assert [block.type for block in response.blocks] == ["table", "actions"]
-    assert response.tools_used == ["get_attendance_summary"]
+    assert response.tools_used == [
+        "get_attendance_summary",
+        "get_exceptional_entry_requests",
+    ]
     assert response.requires_confirmation is False
 
 

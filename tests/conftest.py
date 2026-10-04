@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 
 from app import audit as audit_module
+from app.ai import actions as actions_module
 from app.api import telemetry as telemetry_api_module
 
 
@@ -20,3 +21,14 @@ def disable_real_audit_database_during_tests(monkeypatch):
     )
     monkeypatch.setattr(audit_module, "get_settings", lambda: safe_settings)
     monkeypatch.setattr(telemetry_api_module, "get_settings", lambda: safe_settings)
+
+    async def no_existing_exceptional_entries(*args, **kwargs):
+        return []
+
+    # Less-hours inspection now performs a duplicate read. Keep the suite
+    # hermetic unless a test explicitly supplies ResourcePlus records.
+    monkeypatch.setattr(
+        actions_module,
+        "get_exceptional_entry_requests",
+        no_existing_exceptional_entries,
+    )

@@ -21,6 +21,14 @@ from app.speech.language import detect_text_language
 
 logger = logging.getLogger(__name__)
 MAX_TOOL_ROUNDS = 4
+# The legacy raw-time Request preparation remains callable for compatibility tests
+# and older integrations, but the conversational model must use the guarded v2
+# AttendanceSummary correction path. High-confidence requests are handled before
+# the model by conversation.py.
+MODEL_TOOL_DEFINITIONS = [
+    tool for tool in TOOL_DEFINITIONS
+    if tool.get("name") != "prepare_exceptional_entry"
+]
 ASSISTANT_MESSAGES_TEXT_CONFIG = {
     "format": {
         "type": "json_schema",
@@ -124,7 +132,10 @@ async def run_agent(
     )
     instructions = (
         f"{SYSTEM_PROMPT}\n\n{context}\n"
-        f"The current conversational response language is {language_name}."
+        f"The current conversational response language is {language_name}. "
+        f"This current-turn language requirement has priority over any language "
+        f"used in conversation history. Both display_message and speech_message "
+        f"must be written in {language_name}."
         f"{speech_style}"
     )
     input_items: list[Any] = [*(history or []), {"role": "user", "content": message}]
@@ -139,7 +150,7 @@ async def run_agent(
                 "model": settings.openai_model,
                 "instructions": instructions,
                 "input": input_items,
-                "tools": TOOL_DEFINITIONS,
+                "tools": MODEL_TOOL_DEFINITIONS,
                 "parallel_tool_calls": False,
                 "store": False,
                 "text": ASSISTANT_MESSAGES_TEXT_CONFIG,

@@ -1,3 +1,4 @@
+import base64
 from types import SimpleNamespace
 
 import pytest
@@ -8,6 +9,8 @@ from app.api import voice as voice_module
 from app.main import app
 from app.models.schemas import ChatResponse
 from app.speech import (
+    CandidateRecognition,
+    RecognitionCandidate,
     SpeechAudio,
     SpeechInputError,
     SpeechRecognitionError,
@@ -90,15 +93,18 @@ def test_websocket_stream_start_chunks_end_and_final_result(
 
     async def process(request, *, detected_language):
         calls.append((request, detected_language))
+        message = "### النتيجة الحالية\n\n- التفاصيل" if detected_language == "ar" else "### Current result\n\n- Detail"
+        speech = "نتيجتك الحالية جاهزة." if detected_language == "ar" else "Your current result is ready."
         return ChatResponse(
             success=True,
-            message="### Current result\n\n- Detail",
+            message=message,
             language=detected_language,
             session_id=request.session_id or "stream-session",
-        ).set_speech_message("Your current result is ready.")
+        ).set_speech_message(speech)
 
     async def synthesize(text, *, language: str):
-        assert text == "Your current result is ready."
+        expected_text = "نتيجتك الحالية جاهزة." if expected_language == "ar" else "Your current result is ready."
+        assert text == expected_text
         assert language == expected_language
         return SpeechAudio(b"stream-audio")
 
@@ -131,6 +137,8 @@ def test_websocket_stream_start_chunks_end_and_final_result(
     assert result["detected_locale"] == locale
     assert result["detected_language"] == language
     assert result["session_id"] == "existing-session"
+    assert base64.b64decode(result["audio_base64"]) == b"stream-audio"
+    assert result["audio_mime_type"] == "audio/wav"
     assert recognizer.started is True
     assert len(recognizer.chunks) == 2
     assert len(calls) == 1
@@ -354,6 +362,29 @@ async def test_azure_streaming_final_transcript_uses_existing_language_resolver(
             azure_speech_ar_locale="ar-SA",
         ),
     )
+    async def select_candidates(audio, *, established_language, auto_candidate):
+        del audio, established_language
+        selected_locale = "ar-SA" if expected_language == "ar" else "en-US"
+        selected = RecognitionCandidate(
+            text,
+            selected_locale,
+            None,
+            True,
+            "recognized",
+            "primarily_arabic" if expected_language == "ar" else "primarily_latin",
+        )
+        return CandidateRecognition(
+            selected=selected,
+            auto=auto_candidate,
+            english=selected if expected_language == "en" else None,
+            arabic=selected if expected_language == "ar" else None,
+            primary_locale=selected_locale,
+            fallback_used=True,
+            fallback_locale=selected_locale,
+            selection_reason="test_candidate",
+        )
+
+    monkeypatch.setattr(streaming, "recognize_audio_candidates", select_candidates)
 
     session = streaming.StreamingSpeechRecognizer()
     await session.start()
@@ -366,3 +397,50 @@ async def test_azure_streaming_final_transcript_uses_existing_language_resolver(
     assert recognized.transcript == text
     assert recognized.detected_locale == raw_locale
     assert recognized.detected_language == expected_language
+
+
+def test_websocket_short_turn_uses_same_session_language_policy(monkeypatch) -> None:
+    recognized = iter(
+        (
+            SpeechTranscript("Show my attendance", "en-US", "en"),
+            SpeechTranscript("Yes", "ar-SA", "ar"),
+        )
+    )
+    agent_languages: list[str] = []
+    tts_languages: list[str] = []
+
+    async def process(request, *, detected_language):
+        agent_languages.append(detected_language)
+        return ChatResponse(
+            success=True,
+            message="English response",
+            language=detected_language,
+            session_id=request.session_id,
+        ).set_speech_message("English response")
+
+    async def synthesize(text, *, language):
+        tts_languages.append(language)
+        return SpeechAudio(b"audio")
+
+    monkeypatch.setattr(
+        voice_module,
+        "StreamingSpeechRecognizer",
+        lambda: FakeStreamingRecognizer(next(recognized)),
+    )
+    monkeypatch.setattr(voice_module, "process_chat", process)
+    monkeypatch.setattr(voice_module, "synthesize_speech", synthesize)
+    session_id = "websocket-language-stability"
+    results = []
+    for _ in range(2):
+        with client.websocket_connect("/api/voice/stream") as websocket:
+            websocket.send_json(
+                {"type": "start", "sample_rate": 16_000, "session_id": session_id}
+            )
+            assert websocket.receive_json() == {"type": "ready"}
+            websocket.send_bytes(b"\x00\x00" * 320)
+            websocket.send_json({"type": "end"})
+            results.append(websocket.receive_json())
+
+    assert [result["detected_language"] for result in results] == ["en", "en"]
+    assert agent_languages == ["en", "en"]
+    assert tts_languages == ["en", "en"]

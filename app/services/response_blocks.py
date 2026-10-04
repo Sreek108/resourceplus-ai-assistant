@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
 from datetime import date, datetime
 from typing import Any
@@ -17,6 +18,9 @@ from app.models.schemas import (
     StatCardsBlock,
     TableBlock,
 )
+from app.ai.sessions import ApprovalCandidate
+from app.services.approval_selection import approval_candidates
+from app.services.request_history import EmployeeRequest, normalize_request_history
 
 
 Scalar = str | int | float | bool | None
@@ -138,34 +142,91 @@ def markdown_table(block: TableBlock, *, row_limit: int = MAX_MARKDOWN_ROWS) -> 
     return "\n".join([header, separator, *rows]) + suffix
 
 
+def _profile_key(value: object) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(value).casefold())
+
+
+def _profile_sources(payload: Any) -> list[dict[str, Any]]:
+    """Select employee-data mappings without treating response metadata as profile data."""
+
+    if isinstance(payload, list):
+        first = next((item for item in payload if isinstance(item, dict)), None)
+        return _profile_sources(first) if first is not None else []
+    if not isinstance(payload, dict) or not payload:
+        return []
+
+    normalized = {_profile_key(key): value for key, value in payload.items()}
+    for wrapper in ("data", "profile", "employee"):
+        if wrapper in normalized:
+            return _profile_sources(normalized[wrapper])
+
+    sections: list[dict[str, Any]] = []
+    for section in ("contactinformation", "workinformation"):
+        value = normalized.get(section)
+        if isinstance(value, dict):
+            sections.append(value)
+        elif isinstance(value, list):
+            first = next((item for item in value if isinstance(item, dict)), None)
+            if first is not None:
+                sections.append(first)
+    if sections:
+        return sections
+
+    return [payload] if any(
+        isinstance(value, (str, int, float, bool)) and value not in (None, "")
+        for value in payload.values()
+    ) else []
+
+
 def profile_block(payload: Any) -> KeyValueBlock | None:
-    if not isinstance(payload, dict):
+    sources = _profile_sources(payload)
+    if not sources:
         return None
-    source = payload
-    for candidate in ("Profile", "Employee", "Data"):
-        nested = payload.get(candidate)
-        if isinstance(nested, dict):
-            source = nested
-            break
     labels = {
         "employeename": "Name",
         "employeeemail": "Email",
+        "empemail": "Email",
         "email": "Email",
         "employeecode": "Employee code",
+        "empnumber": "Employee code",
+        "empmobile": "Mobile",
+        "mobile": "Mobile",
         "department": "Department",
         "designation": "Designation",
         "position": "Position",
+        "positionname": "Position",
         "company": "Company",
+        "organization": "Organization",
         "location": "Location",
         "joiningdate": "Joining date",
+        "dateofjoin": "Joining date",
     }
-    items = [
-        BlockItem(label=labels.get(str(key).casefold(), str(key)), value=_scalar(value))
-        for key, value in source.items()
-        if isinstance(value, (str, int, float, bool)) and value not in (None, "")
-        and not str(key).casefold().endswith("id")
-        and str(key).casefold() not in {"instance", "instancename", "tenant"}
-    ]
+    excluded = {
+        "instance",
+        "instancename",
+        "tenant",
+        "success",
+        "message",
+        "status",
+        "code",
+    }
+    items: list[BlockItem] = []
+    seen_labels: set[str] = set()
+    for source in sources:
+        for key, value in source.items():
+            normalized_key = _profile_key(key)
+            if (
+                not isinstance(value, (str, int, float, bool))
+                or value in (None, "")
+                or normalized_key.endswith("id")
+                or normalized_key in excluded
+            ):
+                continue
+            label = labels.get(normalized_key, str(key))
+            if label in seen_labels:
+                continue
+            seen_labels.add(label)
+            items.append(BlockItem(label=label, value=_scalar(value)))
     return KeyValueBlock(title="Profile", items=items) if items else None
 
 
@@ -215,18 +276,51 @@ def attendance_blocks(payload: Any) -> list[ResponseBlock]:
     return blocks
 
 
+def _missing_punch_display_date(value: Any) -> Scalar:
+    """Format the canonical normalized date without deriving a new HR fact."""
+
+    if isinstance(value, datetime):
+        return value.strftime("%d/%m/%Y")
+    if isinstance(value, date):
+        return value.strftime("%d/%m/%Y")
+    if not isinstance(value, str) or not value.strip():
+        return None
+    normalized = value.strip()
+    try:
+        return datetime.strptime(normalized, "%Y-%m-%d").strftime("%d/%m/%Y")
+    except ValueError:
+        return normalized
+
+
+def _missing_punch_display_time(value: Any) -> Scalar:
+    """Split only the documented ResourcePlus date-and-time display shape."""
+
+    if not isinstance(value, str) or not value.strip():
+        return None
+    normalized = value.strip()
+    match = re.fullmatch(r"\d{2}/\d{2}/\d{4} (\d{2}:\d{2})", normalized)
+    return match.group(1) if match else normalized
+
+
 def missing_punch_block(payload: Any) -> TableBlock:
     groups = _records(payload, "missing_punches_by_date")
     rows: list[dict[str, Scalar]] = []
     for group in groups:
-        attendance_date = _first(group, "attendance_date", "date")
+        attendance_date = _missing_punch_display_date(
+            _first(group, "att_date", "attendance_date", "date", default=None)
+        )
         for punch in _records(group, "missing_punches"):
+            correctable = punch.get("is_correctable")
             rows.append(
                 {
                     "date": attendance_date,
-                    "direction": _first(punch, "entry_type"),
-                    "suggested": _first(punch, "suggested_entry_time"),
-                    "correctable": bool(punch.get("is_correctable")),
+                    "direction": _first(punch, "entry_type", default=None),
+                    "suggested": _missing_punch_display_time(
+                        _first(punch, "suggested_entry_time", default=None)
+                    ),
+                    "correctable": (
+                        correctable if isinstance(correctable, bool) else None
+                    ),
                 }
             )
     return TableBlock(
@@ -259,6 +353,61 @@ def day_types_block(payload: Any) -> TableBlock:
     )
 
 
+_LEAVE_BALANCE_KEYS = (
+    "eligiblevacation",
+    "eligibleleave",
+    "vacationbalance",
+    "leavebalance",
+)
+
+
+def _find_named_scalar(payload: Any, normalized_key: str) -> Scalar:
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            key_name = re.sub(r"[^a-z]", "", str(key).casefold())
+            if (
+                key_name == normalized_key
+                and not isinstance(value, bool)
+                and isinstance(value, (str, int, float))
+            ):
+                return value
+        for value in payload.values():
+            found = _find_named_scalar(value, normalized_key)
+            if found not in (None, ""):
+                return found
+    elif isinstance(payload, list):
+        for value in payload:
+            found = _find_named_scalar(value, normalized_key)
+            if found not in (None, ""):
+                return found
+    return None
+
+
+def leave_balance_value(payload: Any) -> Scalar:
+    """Extract only an authoritative overall leave/vacation balance field."""
+
+    for key in _LEAVE_BALANCE_KEYS:
+        value = _find_named_scalar(payload, key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def leave_balance_block(payload: Any, language: str = "en") -> KeyValueBlock | None:
+    value = leave_balance_value(payload)
+    if value in (None, ""):
+        return None
+    return KeyValueBlock(
+        title="رصيد الإجازة" if language == "ar" else "Leave balance",
+        items=[
+            BlockItem(
+                label="الرصيد المستحق" if language == "ar" else "Eligible balance",
+                value=value,
+            )
+        ],
+    )
+
+
 def notifications_block(payload: Any) -> ListBlock:
     items = []
     for row in _records(payload):
@@ -271,50 +420,95 @@ def notifications_block(payload: Any) -> ListBlock:
     return ListBlock(title="Notifications", items=items)
 
 
-def request_status_block(payload: Any) -> TableBlock:
-    records = _records(payload, "merged_requests")
-    rows = []
-    for wrapped in records:
-        record = wrapped.get("record") if isinstance(wrapped.get("record"), dict) else wrapped
-        rows.append(
-            {
-                "type": _first(wrapped, "request_kind", "requestType", "type"),
-                "date": _first(record, "date", "dateFrom", "AttDate", "requestDate"),
-                "detail": _first(record, "dayType", "reasonName", "detail", "description"),
-                "status": _first(wrapped, "raw_status", "status", default=_first(record, "status")),
-            }
-        )
+def request_history_block(
+    requests: Iterable[EmployeeRequest],
+    language: str = "en",
+) -> TableBlock:
+    rows = [
+        {
+            "request": item.friendly_category,
+            # Safe compatibility alias used by older conversation helpers only.
+            "type": item.detail if item.category == "leave" else item.friendly_category,
+            "date": item.request_date or "—",
+            "detail": item.detail,
+            "status": item.resolved_status,
+        }
+        for item in requests
+    ]
     return TableBlock(
-        title="My requests",
+        title="طلباتي" if language == "ar" else "My requests",
         columns=[
-            BlockColumn(key="type", label="Type"),
-            BlockColumn(key="date", label="Date"),
-            BlockColumn(key="detail", label="Detail"),
-            BlockColumn(key="status", label="Status"),
+            BlockColumn(key="request", label="الطلب" if language == "ar" else "Request"),
+            BlockColumn(key="date", label="التاريخ" if language == "ar" else "Date"),
+            BlockColumn(key="detail", label="التفاصيل" if language == "ar" else "Detail"),
+            BlockColumn(key="status", label="الحالة" if language == "ar" else "Status"),
         ],
         rows=rows,
     )
 
 
-def approvals_block(payload: Any) -> TableBlock:
+def request_status_block(payload: Any, language: str = "en") -> TableBlock:
+    return request_history_block(normalize_request_history(payload), language)
+
+
+def approvals_block(
+    payload: Any,
+    language: str = "en",
+) -> TableBlock:
+    candidates = (
+        tuple(payload)
+        if isinstance(payload, (list, tuple))
+        and all(isinstance(item, ApprovalCandidate) for item in payload)
+        else approval_candidates(payload)
+    )
     rows = [
         {
-            "employee": _first(row, "employeeName", "EmployeeName", "name"),
-            "type": _first(row, "requestType", "type"),
-            "detail": _first(row, "detail", "description", "dayType", "reasonName"),
-            "status": _first(row, "status", default="Pending"),
+            "employee": candidate.employee_name,
+            "request": candidate.category,
+            "date": candidate.request_date or "—",
+            "detail": candidate.detail,
+            "status": candidate.status,
+            "action": "",
         }
-        for row in _records(payload, "PendingApprovals", "Requests", "Data")
+        for candidate in candidates
+    ]
+    row_actions = [
+        [
+            BlockAction(
+                label="موافقة" if language == "ar" else "Approve",
+                value=f"Approve request {candidate.ordinal}",
+                style="primary",
+                payload={
+                    "kind": "pending_approval",
+                    "decision": "approve",
+                    "ordinal": candidate.ordinal,
+                },
+            ),
+            BlockAction(
+                label="رفض" if language == "ar" else "Reject",
+                value=f"Reject request {candidate.ordinal}",
+                style="danger",
+                payload={
+                    "kind": "pending_approval",
+                    "decision": "reject",
+                    "ordinal": candidate.ordinal,
+                },
+            ),
+        ]
+        for candidate in candidates
     ]
     return TableBlock(
-        title="Pending approvals",
+        title="طلبات بانتظار الموافقة" if language == "ar" else "Pending approvals",
         columns=[
-            BlockColumn(key="employee", label="Employee"),
-            BlockColumn(key="type", label="Type"),
-            BlockColumn(key="detail", label="Detail"),
-            BlockColumn(key="status", label="Status"),
+            BlockColumn(key="employee", label="الموظف" if language == "ar" else "Employee"),
+            BlockColumn(key="request", label="الطلب" if language == "ar" else "Request"),
+            BlockColumn(key="date", label="التاريخ" if language == "ar" else "Date"),
+            BlockColumn(key="detail", label="التفاصيل" if language == "ar" else "Detail"),
+            BlockColumn(key="status", label="الحالة" if language == "ar" else "Status"),
+            BlockColumn(key="action", label="الإجراء" if language == "ar" else "Action"),
         ],
         rows=rows,
+        row_actions=row_actions,
     )
 
 
@@ -342,6 +536,10 @@ def less_hours_block(days: Iterable[object], language: str = "en") -> TableBlock
     eligibility_labels = (
         {
             "eligible": "قابل للتصحيح",
+            "correction_available": "التصحيح متاح",
+            "approved_exception": "استثناء معتمد",
+            "existing_request": "طلب موجود",
+            "correction_unavailable": "التصحيح غير متاح",
             "no_punches": "لا توجد بصمات حضور",
             "week_end": "عطلة أسبوعية",
             "holiday": "عطلة",
@@ -351,7 +549,11 @@ def less_hours_block(days: Iterable[object], language: str = "en") -> TableBlock
         }
         if language == "ar"
         else {
-            "eligible": "Correction candidate",
+            "eligible": "Correction available",
+            "correction_available": "Correction available",
+            "approved_exception": "Approved exception",
+            "existing_request": "Existing request",
+            "correction_unavailable": "Correction unavailable",
             "no_punches": "No attendance punches",
             "week_end": "Week End",
             "holiday": "Holiday",
@@ -361,7 +563,9 @@ def less_hours_block(days: Iterable[object], language: str = "en") -> TableBlock
         }
     )
     rows = []
-    for day in days:
+    for resolved_day in days:
+        day = getattr(resolved_day, "day", resolved_day)
+        state = getattr(resolved_day, "state", getattr(day, "eligibility"))
         rows.append(
             {
                 "date": getattr(day, "attendance_date").isoformat(),
@@ -371,13 +575,13 @@ def less_hours_block(days: Iterable[object], language: str = "en") -> TableBlock
                 "worked": getattr(day, "worked_hours"),
                 "less": getattr(day, "less_hours"),
                 "action": eligibility_labels.get(
-                    getattr(day, "eligibility"),
-                    str(getattr(day, "eligibility")),
+                    state,
+                    str(state),
                 ),
             }
         )
     return TableBlock(
-        title="الحضور بساعات ناقصة" if language == "ar" else "Less-hours attendance",
+        title="فجوات الحضور" if language == "ar" else "Attendance gaps",
         columns=(
             [
                 BlockColumn(key="date", label="التاريخ"),
@@ -407,25 +611,30 @@ def less_hours_correction_actions(
     days: Iterable[object],
     language: str = "en",
 ) -> ActionsBlock | None:
-    actions = [
-        BlockAction(
-            label=(
-                f"صحح {getattr(day, 'attendance_date').isoformat()}"
-                if language == "ar"
-                else f"Correct {getattr(day, 'attendance_date').isoformat()}"
-            ),
-            value=(
-                (
-                    "صحح الساعات الناقصة يوم "
+    actions = []
+    for resolved_day in days:
+        if not getattr(resolved_day, "correction_available", True):
+            continue
+        day = getattr(resolved_day, "day", resolved_day)
+        attendance_date = getattr(day, "attendance_date").isoformat()
+        actions.append(
+            BlockAction(
+                label=(
+                    f"صحح {attendance_date}"
                     if language == "ar"
-                    else "Correct my less hours on "
-                )
-                + f"{getattr(day, 'attendance_date').isoformat()}"
-            ),
-            style="primary",
+                    else f"Correct {attendance_date}"
+                ),
+                value=(
+                    (
+                        "صحح الساعات الناقصة يوم "
+                        if language == "ar"
+                        else "Correct my less hours on "
+                    )
+                    + attendance_date
+                ),
+                style="primary",
+            )
         )
-        for day in days
-    ]
     title = "الإجراءات المتاحة" if language == "ar" else "Available actions"
     return ActionsBlock(title=title, actions=actions) if actions else None
 
@@ -463,10 +672,10 @@ def exceptional_balance_block(payload: Any, language: str = "en") -> KeyValueBlo
     ]
     limit_type = payload.get("limitType")
     if limit_type == 1:
-        items.insert(1, BlockItem(label="الوحدة" if language == "ar" else "Unit", value="عدد الحالات" if language == "ar" else "Exception count"))
+        items.insert(1, BlockItem(label="الوحدة" if language == "ar" else "Unit", value="عدد الحالات" if language == "ar" else "Correction count"))
     elif limit_type == 2:
         items.insert(1, BlockItem(label="الوحدة" if language == "ar" else "Unit", value="دقائق" if language == "ar" else "Minutes"))
-    title = "رصيد السماح" if language == "ar" else "Exceptional-entry allowance"
+    title = "رصيد السماح" if language == "ar" else "Attendance correction allowance"
     return KeyValueBlock(title=title, items=items) if items else None
 
 
@@ -480,7 +689,7 @@ def exceptional_balance_blocks(payload: Any, language: str = "en") -> list[Respo
                 title=(
                     "بدل إدخال الحضور الاستثنائي"
                     if language == "ar"
-                    else "Exceptional-entry allowance"
+                    else "Attendance correction allowance"
                 ),
                 message=(
                     "لا توجد لديك سياسة رصيد سماح لهذا التاريخ."
@@ -500,7 +709,7 @@ def exceptional_entries_block(
     language: str = "en",
 ) -> TableBlock:
     return TableBlock(
-        title=title or ("طلبات الاستثناء" if language == "ar" else "Exceptional entries"),
+        title=title or ("طلبات تصحيح الحضور" if language == "ar" else "Attendance correction requests"),
         columns=(
             [
                 BlockColumn(key="date", label="التاريخ"),
@@ -526,7 +735,7 @@ def cancellable_exceptions_block(
 ) -> TableBlock:
     return exceptional_entries_block(
         list(rows),
-        title="طلبات استثناء قابلة للإلغاء" if language == "ar" else "Cancellable exceptional entries",
+        title="طلبات تصحيح حضور قابلة للإلغاء" if language == "ar" else "Correction requests you can cancel",
         language=language,
     )
 
@@ -594,15 +803,15 @@ def exceptional_submission_blocks(
     if not resolved_success:
         title = "لم يكتمل التصحيح" if language == "ar" else "Correction not completed"
     elif language == "ar" and auto_approved is True:
-        title = "تمت الموافقة تلقائياً"
+        title = "تم التصحيح والموافقة"
     elif language == "ar":
         title = "تم إرسال التصحيح"
     elif auto_approved is True:
-        title = "Correction auto-approved"
+        title = "Correction completed and approved"
     else:
         title = "Correction submitted"
     message = payload.get("message")
-    if not isinstance(message, str) or not message.strip():
+    if resolved_success or not isinstance(message, str) or not message.strip():
         if not resolved_success:
             message = (
                 "تعذّر إكمال تصحيح حضورك."
@@ -611,15 +820,15 @@ def exceptional_submission_blocks(
             )
         elif auto_approved is True:
             message = (
-                "تمت الموافقة تلقائيًا على تصحيح حضورك."
+                "تم تصحيح حضورك واعتماده تلقائياً."
                 if language == "ar"
-                else "Your attendance correction was auto-approved."
+                else "Done — your attendance correction was approved automatically."
             )
         elif auto_approved is False:
             message = (
-                "تم إرسال تصحيح حضورك وهو بانتظار موافقة المدير."
+                "أرسلت تصحيح حضورك لموافقة مديرك."
                 if language == "ar"
-                else "Your attendance correction was submitted for manager approval."
+                else "I've sent your attendance correction to your manager for approval."
             )
         else:
             message = (

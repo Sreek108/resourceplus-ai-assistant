@@ -1,4 +1,5 @@
 import base64
+import inspect
 import json
 import logging
 
@@ -12,8 +13,20 @@ from app.audit import (
     start_interaction_audit,
 )
 from app.config import get_settings
-from app.identity import RequestIdentityError, resolve_request_identity
-from app.models.schemas import ChatRequest, VoiceChatResponse
+from app.identity import (
+    RequestIdentity,
+    RequestIdentityError,
+    bind_request_identity,
+    reset_request_identity,
+    resolve_request_identity,
+)
+from app.ai.sessions import SessionIdentityMismatch, session_store
+from app.models.schemas import (
+    ChatRequest,
+    SpeechSynthesisRequest,
+    SpeechSynthesisResponse,
+    VoiceChatResponse,
+)
 from app.observability import (
     SAFE_VOICE_ERROR_CATEGORIES,
     current_voice_trace,
@@ -22,16 +35,18 @@ from app.observability import (
     reset_voice_trace,
     start_voice_trace,
 )
-from app.services.chat import process_chat
+from app.services.chat import enforce_voice_response_language, process_chat
 from app.speech import (
     SpeechConfigurationError,
     SpeechInputError,
     SpeechRecognitionError,
     SpeechSynthesisError,
+    SpeechTranscript,
     markdown_to_speech_text,
     synthesize_speech,
     transcribe_audio,
     StreamingSpeechRecognizer,
+    resolve_session_language,
 )
 from app.telemetry import (
     TRACE_HEADER,
@@ -48,6 +63,169 @@ from app.telemetry import (
 router = APIRouter(prefix="/api/voice", tags=["voice"])
 MAX_AUDIO_BYTES = 10 * 1024 * 1024
 latency_logger = logging.getLogger("app.voice_latency")
+
+
+@router.post("/synthesize", response_model=SpeechSynthesisResponse)
+async def synthesize_assistant_message(
+    request: SpeechSynthesisRequest,
+) -> SpeechSynthesisResponse:
+    """Synthesize one already-rendered assistant message without any HR call."""
+
+    speech_text = markdown_to_speech_text(request.text)
+    if not speech_text:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "empty_speech_text", "message": "There is no text to read aloud."},
+        )
+    try:
+        spoken = await synthesize_speech(speech_text, language=request.language)
+    except SpeechConfigurationError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "voice_unavailable", "message": "Voice is temporarily unavailable."},
+        ) from exc
+    except (SpeechInputError, SpeechSynthesisError) as exc:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "speech_synthesis_failed",
+                "message": "The message could not be read aloud.",
+            },
+        ) from exc
+    if not spoken.data or not spoken.locale or not spoken.voice_name:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "speech_synthesis_failed",
+                "message": "The message could not be read aloud.",
+            },
+        )
+    return SpeechSynthesisResponse(
+        audio_base64=base64.b64encode(spoken.data).decode("ascii"),
+        audio_mime_type=spoken.mime_type,
+        language=request.language,
+        tts_locale=spoken.locale,
+        tts_voice=spoken.voice_name,
+    )
+
+
+async def _transcribe_buffered_audio(
+    payload: bytes,
+    *,
+    content_type: str | None,
+    established_language: str | None,
+    phrase_hints: tuple[str, ...] = (),
+) -> SpeechTranscript:
+    parameters = inspect.signature(transcribe_audio).parameters.values()
+    supports_context = any(
+        parameter.name == "established_language"
+        or parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+    kwargs = {"content_type": content_type}
+    if supports_context:
+        kwargs["established_language"] = established_language
+    supports_hints = any(
+        parameter.name == "phrase_hints"
+        or parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+    if supports_hints:
+        kwargs["phrase_hints"] = phrase_hints
+    return await transcribe_audio(payload, **kwargs)
+
+
+def _live_day_type_phrase_hints(session_id: str) -> tuple[str, ...]:
+    draft = session_store.get_conversation_draft(session_id)
+    if draft is None or draft.intent != "book_day_type":
+        return ()
+    raw = draft.slots.get("day_type_options")
+    if not raw:
+        return ()
+    try:
+        options = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return ()
+    hints: list[str] = []
+    for option in options if isinstance(options, list) else []:
+        name = option.get("dayType") if isinstance(option, dict) else option
+        if isinstance(name, str) and name.strip():
+            hints.append(name.strip())
+    return tuple(dict.fromkeys(hints))
+
+
+def _voice_session_language_context(
+    *,
+    session_id: str | None,
+    identity: RequestIdentity,
+) -> tuple[str | None, str | None, tuple[str, ...]]:
+    identity_token = bind_request_identity(identity)
+    try:
+        try:
+            resolved_session_id = session_store.ensure_session(session_id)
+            return (
+                resolved_session_id,
+                session_store.get_last_confident_language(resolved_session_id),
+                _live_day_type_phrase_hints(resolved_session_id),
+            )
+        except SessionIdentityMismatch:
+            return session_id, None, ()
+    finally:
+        reset_request_identity(identity_token)
+
+
+def _resolve_voice_turn_language(
+    recognized: SpeechTranscript,
+    *,
+    session_id: str | None,
+    identity: RequestIdentity,
+):
+    """Resolve and remember voice language inside the identity-bound session."""
+
+    identity_token = bind_request_identity(identity)
+    try:
+        try:
+            resolved_session_id = session_store.ensure_session(session_id)
+        except SessionIdentityMismatch:
+            # Do not inspect or mutate another identity's session. The shared chat
+            # service will return its established safe identity-mismatch response.
+            fallback = "ar" if get_settings().rp_default_lang == 2 else "en"
+            return session_id, resolve_session_language(
+                recognized.transcript,
+                fallback=fallback,
+            )
+        last_confident = session_store.get_last_confident_language(
+            resolved_session_id
+        )
+        fallback = "ar" if get_settings().rp_default_lang == 2 else "en"
+        resolution = resolve_session_language(
+            recognized.transcript,
+            last_confident_language=last_confident,
+            fallback=fallback,
+        )
+        session_store.set_last_confident_language(
+            resolved_session_id,
+            resolution.last_confident_language,
+        )
+        return resolved_session_id, resolution
+    finally:
+        reset_request_identity(identity_token)
+
+
+def _record_language_resolution(audit, recognized, resolution) -> None:
+    audit.raw_detected_locale = recognized.detected_locale
+    audit.resolved_language = resolution.language
+    audit.language_resolution_source = resolution.source
+    audit.short_utterance = resolution.short_utterance
+    audit.last_confident_language = resolution.last_confident_language
+    audit.stt_confidence = recognized.stt_confidence
+    audit.stt_primary_locale = recognized.stt_primary_locale
+    audit.stt_primary_confidence = recognized.stt_primary_confidence
+    audit.stt_fallback_used = recognized.stt_fallback_used
+    audit.stt_fallback_locale = recognized.stt_fallback_locale
+    audit.stt_fallback_confidence = recognized.stt_fallback_confidence
+    audit.stt_selection_reason = recognized.stt_selection_reason
+    audit.transcript_script_class = recognized.transcript_script_class
 
 
 def _capture_voice_trace(audit) -> None:
@@ -150,13 +328,23 @@ async def voice_chat(
         reset_interaction_audit(audit_token)
         raise HTTPException(status_code=413, detail="Audio upload exceeds 10 MB.")
     try:
-        recognized = await transcribe_audio(
+        session_id, established_language, phrase_hints = _voice_session_language_context(
+            session_id=session_id,
+            identity=request_identity,
+        )
+        recognized = await _transcribe_buffered_audio(
             payload,
             content_type=audio.content_type,
+            established_language=established_language,
+            phrase_hints=phrase_hints,
+        )
+        session_id, language_resolution = _resolve_voice_turn_language(
+            recognized,
+            session_id=session_id,
+            identity=request_identity,
         )
         audit.user_text = recognized.transcript
-        audit.raw_detected_locale = recognized.detected_locale
-        audit.resolved_language = recognized.detected_language
+        _record_language_resolution(audit, recognized, language_resolution)
         with measure_stage("agent"):
             chat_response = await process_chat(
                 ChatRequest(
@@ -166,8 +354,13 @@ async def voice_chat(
                     instance=request_identity.instance,
                     confirmation_id=confirmation_id,
                 ),
-                detected_language=recognized.detected_language,
+                detected_language=language_resolution.language,
             )
+        chat_response, guard_result = enforce_voice_response_language(
+            chat_response,
+            language_resolution.language,
+        )
+        audit.response_language_guard_result = guard_result
         audit.session_reference = audit.session_reference or safe_session_reference(
             chat_response.session_id
         )
@@ -253,7 +446,7 @@ async def voice_chat(
                 "result_status": "completed_with_tts_error",
                 "tts_generated": False,
                 "transcript": recognized.transcript,
-                "detected_language": recognized.detected_language,
+                "detected_language": language_resolution.language,
                 "detected_locale": recognized.detected_locale,
                 "response_language": chat_response.language,
                 "assistant_text": chat_response.message,
@@ -273,7 +466,7 @@ async def voice_chat(
         response = VoiceChatResponse(
             **chat_response.model_dump(),
             transcript=recognized.transcript,
-            detected_language=recognized.detected_language,
+            detected_language=language_resolution.language,
             detected_locale=recognized.detected_locale,
             audio_base64=base64.b64encode(spoken.data).decode("ascii"),
             audio_mime_type=spoken.mime_type,
@@ -402,7 +595,18 @@ async def voice_stream(websocket: WebSocket) -> None:
             input_source="stt",
             session_id=session_id,
         )
-        recognizer = StreamingSpeechRecognizer()
+        session_id, established_language, phrase_hints = _voice_session_language_context(
+            session_id=session_id,
+            identity=request_identity,
+        )
+        try:
+            recognizer = StreamingSpeechRecognizer(
+                established_language=established_language,
+                phrase_hints=phrase_hints,
+            )
+        except TypeError:
+            # Compatibility for test doubles and older injected recognizers.
+            recognizer = StreamingSpeechRecognizer()
         await recognizer.start()
         await websocket.send_json({"type": "ready"})
         if progressive_events:
@@ -462,21 +666,25 @@ async def voice_stream(websocket: WebSocket) -> None:
         with measure_stage("post_release_stt_finalize"):
             recognized = await recognizer.finish()
         completed = True
+        session_id, language_resolution = _resolve_voice_turn_language(
+            recognized,
+            session_id=session_id,
+            identity=request_identity,
+        )
 
         if progressive_events:
             await websocket.send_json(
                 {
                     "type": "transcript_final",
                     "transcript": recognized.transcript,
-                    "detected_language": recognized.detected_language,
+                    "detected_language": language_resolution.language,
                     "detected_locale": recognized.detected_locale,
                 }
             )
             await websocket.send_json({"type": "processing"})
 
         audit.user_text = recognized.transcript
-        audit.raw_detected_locale = recognized.detected_locale
-        audit.resolved_language = recognized.detected_language
+        _record_language_resolution(audit, recognized, language_resolution)
         with measure_stage("agent"):
             chat_response = await process_chat(
                 ChatRequest(
@@ -486,8 +694,13 @@ async def voice_stream(websocket: WebSocket) -> None:
                     instance=request_identity.instance,
                     confirmation_id=confirmation_id,
                 ),
-                detected_language=recognized.detected_language,
+                detected_language=language_resolution.language,
             )
+        chat_response, guard_result = enforce_voice_response_language(
+            chat_response,
+            language_resolution.language,
+        )
+        audit.response_language_guard_result = guard_result
         audit.session_reference = audit.session_reference or safe_session_reference(
             chat_response.session_id
         )
@@ -557,7 +770,7 @@ async def voice_stream(websocket: WebSocket) -> None:
         response = VoiceChatResponse(
             **chat_response.model_dump(),
             transcript=recognized.transcript,
-            detected_language=recognized.detected_language,
+            detected_language=language_resolution.language,
             detected_locale=recognized.detected_locale,
             audio_base64=(
                 base64.b64encode(spoken.data).decode("ascii") if spoken else ""

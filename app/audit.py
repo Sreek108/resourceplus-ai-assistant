@@ -74,6 +74,9 @@ SAFE_ACTION_RESULTS = frozenset(
         "auto_approved",
         "cancelled",
         "approved",
+        "rejected",
+        "approval_pending_verification",
+        "approval_verification_unavailable",
         "updated",
         "succeeded",
         "failed",
@@ -91,7 +94,7 @@ SAFE_ACTION_TYPES = frozenset(
         "update_notification_read_status",
     }
 )
-AUDIT_SCHEMA_VERSION = 4
+AUDIT_SCHEMA_VERSION = 6
 
 
 @dataclass
@@ -109,6 +112,18 @@ class InteractionAudit:
     timestamp: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
     raw_detected_locale: str | None = None
     resolved_language: str | None = None
+    language_resolution_source: str | None = None
+    short_utterance: bool | None = None
+    last_confident_language: str | None = None
+    stt_confidence: float | None = None
+    stt_primary_locale: str | None = None
+    stt_primary_confidence: float | None = None
+    stt_fallback_used: bool | None = None
+    stt_fallback_locale: str | None = None
+    stt_fallback_confidence: float | None = None
+    stt_selection_reason: str | None = None
+    transcript_script_class: str | None = None
+    response_language_guard_result: str | None = None
     response_language: str | None = None
     display_message: str | None = None
     speech_message: str | None = None
@@ -324,6 +339,18 @@ class AuditStore:
         "error_stage": "TEXT",
         "input_source": "TEXT",
         "response_language": "TEXT",
+        "language_resolution_source": "TEXT",
+        "short_utterance": "INTEGER",
+        "last_confident_language": "TEXT",
+        "stt_confidence": "REAL",
+        "stt_primary_locale": "TEXT",
+        "stt_primary_confidence": "REAL",
+        "stt_fallback_used": "INTEGER",
+        "stt_fallback_locale": "TEXT",
+        "stt_fallback_confidence": "REAL",
+        "stt_selection_reason": "TEXT",
+        "transcript_script_class": "TEXT",
+        "response_language_guard_result": "TEXT",
         "tts_requested": "INTEGER",
         "tts_generated": "INTEGER",
         "tts_locale": "TEXT",
@@ -372,6 +399,18 @@ class AuditStore:
                         user_text TEXT,
                         raw_detected_locale TEXT,
                         resolved_language TEXT,
+                        language_resolution_source TEXT,
+                        short_utterance INTEGER,
+                        last_confident_language TEXT,
+                        stt_confidence REAL,
+                        stt_primary_locale TEXT,
+                        stt_primary_confidence REAL,
+                        stt_fallback_used INTEGER,
+                        stt_fallback_locale TEXT,
+                        stt_fallback_confidence REAL,
+                        stt_selection_reason TEXT,
+                        transcript_script_class TEXT,
+                        response_language_guard_result TEXT,
                         display_message TEXT,
                         speech_message TEXT,
                         tts_text TEXT,
@@ -397,7 +436,7 @@ class AuditStore:
                         confirmed INTEGER,
                         action_result TEXT,
                         latency_unit TEXT NOT NULL DEFAULT 'milliseconds',
-                        schema_version INTEGER NOT NULL DEFAULT 4
+                        schema_version INTEGER NOT NULL DEFAULT 6
                     )
                     """
                 )
@@ -457,6 +496,12 @@ class AuditStore:
                     interaction_id, timestamp, trace_id, app_version, git_commit,
                     environment, deployment_id, session_reference, input_mode,
                     user_text, raw_detected_locale, resolved_language,
+                    language_resolution_source, short_utterance,
+                    last_confident_language, stt_confidence,
+                    stt_primary_locale, stt_primary_confidence,
+                    stt_fallback_used, stt_fallback_locale,
+                    stt_fallback_confidence, stt_selection_reason,
+                    transcript_script_class, response_language_guard_result,
                     display_message, speech_message, tts_text, tools_json,
                     resourceplus_json, model_requests, latencies_json, success,
                     error_category, error_owner, error_stage,
@@ -465,7 +510,7 @@ class AuditStore:
                     tts_locale, tts_voice, autoplay_result, result_status,
                     action_type, action_state,
                     confirmed, action_result, latency_unit, schema_version
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     audit.interaction_id,
@@ -480,6 +525,18 @@ class AuditStore:
                     *content[:1],
                     audit.raw_detected_locale,
                     audit.resolved_language,
+                    audit.language_resolution_source,
+                    None if audit.short_utterance is None else int(audit.short_utterance),
+                    audit.last_confident_language,
+                    audit.stt_confidence,
+                    audit.stt_primary_locale,
+                    audit.stt_primary_confidence,
+                    None if audit.stt_fallback_used is None else int(audit.stt_fallback_used),
+                    audit.stt_fallback_locale,
+                    audit.stt_fallback_confidence,
+                    audit.stt_selection_reason,
+                    audit.transcript_script_class,
+                    audit.response_language_guard_result,
                     *content[1:],
                     json.dumps(audit.tools_used, ensure_ascii=False),
                     json.dumps(audit.resourceplus_calls, ensure_ascii=False),
@@ -547,7 +604,10 @@ class AuditStore:
         item["latencies"] = latencies
         item["success"] = bool(item["success"])
         item["confirmation_required"] = bool(item["confirmation_required"])
-        for nullable_bool in ("tts_requested", "tts_generated", "confirmed"):
+        for nullable_bool in (
+            "short_utterance", "stt_fallback_used", "tts_requested",
+            "tts_generated", "confirmed"
+        ):
             if item.get(nullable_bool) is not None:
                 item[nullable_bool] = bool(item[nullable_bool])
         return item

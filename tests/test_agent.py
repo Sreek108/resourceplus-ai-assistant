@@ -345,7 +345,7 @@ async def test_natural_late_arrival_statement_reaches_normal_hr_processing(
     assert "can't submit one for you" in result.message
     assert result.tools_used == []
     assert responses.calls[0]["input"][-1] == {"role": "user", "content": message}
-    assert responses.calls[0]["tools"] == agent.TOOL_DEFINITIONS
+    assert responses.calls[0]["tools"] == agent.MODEL_TOOL_DEFINITIONS
     assert "HR needs expressed as everyday situations" in (
         responses.calls[0]["instructions"]
     )
@@ -367,6 +367,9 @@ async def test_arabic_greeting_remains_natural_and_conversational(monkeypatch) -
     assert result.message == response_text
     assert result.tools_used == []
     assert "response language is Arabic" in responses.calls[0]["instructions"]
+    assert "priority over any language used in conversation history" in (
+        responses.calls[0]["instructions"]
+    )
 
 
 @pytest.mark.asyncio

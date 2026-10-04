@@ -52,6 +52,30 @@ class ConversationDraft:
 
 
 @dataclass(frozen=True)
+class ApprovalCandidate:
+    """Identity-bound pending request facts; IDs are never rendered to users."""
+
+    ordinal: int
+    request_id: str = field(repr=False)
+    request_type: str = field(repr=False)
+    employee_name: str
+    category: str
+    detail: str
+    request_date: str
+    status: str = "Pending"
+
+
+@dataclass(frozen=True)
+class RequestCorrelation:
+    """Safe session evidence for reconciling ambiguous request statuses."""
+
+    category: str
+    request_date: str
+    detail: str
+    state: str
+
+
+@dataclass(frozen=True)
 class TrustedResultContext:
     """Non-executable provenance for the latest successful ResourcePlus result."""
 
@@ -59,6 +83,17 @@ class TrustedResultContext:
     tools_used: tuple[str, ...]
     language: str
     created_at: datetime
+    correction_dates: tuple[str, ...] = ()
+    attendance_period: tuple[str, str] | None = None
+    attendance_period_label: str | None = None
+    attendance_period_source: str | None = None
+    discussed_date: str | None = None
+    recent_request_category: str | None = None
+    recent_request_date: str | None = None
+    recent_request_detail: str | None = None
+    recent_request_state: str | None = None
+    request_correlations: tuple[RequestCorrelation, ...] = ()
+    approval_candidates: tuple[ApprovalCandidate, ...] = ()
 
 
 @dataclass
@@ -73,6 +108,7 @@ class _SessionState:
     exceptional_entry_history_start: int | None = None
     expired_pending_language: str | None = None
     expired_pending_action_type: str | None = None
+    last_confident_language: str | None = None
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -90,6 +126,14 @@ class SessionIdentityMismatch(Exception):
 
 class SessionStore(Protocol):
     def ensure_session(self, session_id: str | None = None) -> str: ...
+
+    def get_last_confident_language(self, session_id: str) -> str | None: ...
+
+    def set_last_confident_language(
+        self,
+        session_id: str,
+        language: str | None,
+    ) -> None: ...
 
     def create_pending_action(
         self,
@@ -148,6 +192,16 @@ class SessionStore(Protocol):
         message: str,
         tools_used: list[str] | tuple[str, ...],
         language: str,
+        correction_dates: tuple[str, ...] | None = None,
+        attendance_period: tuple[str, str] | None = None,
+        attendance_period_label: str | None = None,
+        attendance_period_source: str | None = None,
+        discussed_date: str | None = None,
+        recent_request_category: str | None = None,
+        recent_request_date: str | None = None,
+        recent_request_detail: str | None = None,
+        recent_request_state: str | None = None,
+        approval_candidates: tuple[ApprovalCandidate, ...] | None = None,
     ) -> TrustedResultContext: ...
 
     def get_trusted_result(self, session_id: str) -> TrustedResultContext | None: ...
@@ -230,6 +284,17 @@ class InMemorySessionStore:
             tools_used=context.tools_used,
             language=context.language,
             created_at=context.created_at,
+            correction_dates=context.correction_dates,
+            attendance_period=context.attendance_period,
+            attendance_period_label=context.attendance_period_label,
+            attendance_period_source=context.attendance_period_source,
+            discussed_date=context.discussed_date,
+            recent_request_category=context.recent_request_category,
+            recent_request_date=context.recent_request_date,
+            recent_request_detail=context.recent_request_detail,
+            recent_request_state=context.recent_request_state,
+            request_correlations=context.request_correlations,
+            approval_candidates=context.approval_candidates,
         )
 
     def _remove_stale_sessions(self, current: datetime) -> None:
@@ -278,6 +343,24 @@ class InMemorySessionStore:
             else:
                 state.updated_at = current
             return resolved
+
+    def get_last_confident_language(self, session_id: str) -> str | None:
+        with self._lock:
+            state = self._owned_state(session_id)
+            return state.last_confident_language if state is not None else None
+
+    def set_last_confident_language(
+        self,
+        session_id: str,
+        language: str | None,
+    ) -> None:
+        if language is not None and language not in {"en", "ar"}:
+            raise ValueError("Conversation language must be en, ar, or None.")
+        with self._lock:
+            self.ensure_session(session_id)
+            state = self._sessions[session_id]
+            state.last_confident_language = language
+            state.updated_at = self._now()
 
     def create_pending_action(
         self,
@@ -407,17 +490,101 @@ class InMemorySessionStore:
         message: str,
         tools_used: list[str] | tuple[str, ...],
         language: str,
+        correction_dates: tuple[str, ...] | None = None,
+        attendance_period: tuple[str, str] | None = None,
+        attendance_period_label: str | None = None,
+        attendance_period_source: str | None = None,
+        discussed_date: str | None = None,
+        recent_request_category: str | None = None,
+        recent_request_date: str | None = None,
+        recent_request_detail: str | None = None,
+        recent_request_state: str | None = None,
+        approval_candidates: tuple[ApprovalCandidate, ...] | None = None,
     ) -> TrustedResultContext:
         if not message.strip() or not tools_used or language not in {"en", "ar"}:
             raise ValueError("Trusted result provenance is incomplete.")
         with self._lock:
             self.ensure_session(session_id)
             current = self._now()
+            previous = self._sessions[session_id].trusted_result
+            correlations = list(previous.request_correlations if previous is not None else ())
+            correlation_date = recent_request_date
+            correlation_state = recent_request_state
+            if correlation_date is not None and correlation_state is not None:
+                correlation_category = recent_request_category or "attendance_correction"
+                correlation_detail = recent_request_detail or ""
+                correlation = RequestCorrelation(
+                    category=correlation_category,
+                    request_date=correlation_date,
+                    detail=correlation_detail,
+                    state=correlation_state,
+                )
+                correlations = [
+                    item for item in correlations
+                    if not (
+                        item.category == correlation.category
+                        and item.request_date == correlation.request_date
+                        and item.detail.casefold() == correlation.detail.casefold()
+                    )
+                ]
+                correlations.append(correlation)
+                correlations = correlations[-20:]
             context = TrustedResultContext(
                 message=message.strip(),
                 tools_used=tuple(dict.fromkeys(tools_used)),
                 language=language,
                 created_at=current,
+                correction_dates=(
+                    correction_dates
+                    if correction_dates is not None
+                    else previous.correction_dates if previous is not None else ()
+                ),
+                attendance_period=(
+                    attendance_period
+                    if attendance_period is not None
+                    else previous.attendance_period if previous is not None else None
+                ),
+                attendance_period_label=(
+                    attendance_period_label
+                    if attendance_period_label is not None
+                    else previous.attendance_period_label if previous is not None else None
+                ),
+                attendance_period_source=(
+                    attendance_period_source
+                    if attendance_period_source is not None
+                    else previous.attendance_period_source if previous is not None else None
+                ),
+                discussed_date=(
+                    discussed_date
+                    if discussed_date is not None
+                    else previous.discussed_date if previous is not None else None
+                ),
+                recent_request_category=(
+                    recent_request_category
+                    if recent_request_category is not None
+                    else previous.recent_request_category if previous is not None else None
+                ),
+                recent_request_date=(
+                    recent_request_date
+                    if recent_request_date is not None
+                    else previous.recent_request_date if previous is not None else None
+                ),
+                recent_request_detail=(
+                    recent_request_detail
+                    if recent_request_detail is not None
+                    else previous.recent_request_detail if previous is not None else None
+                ),
+                recent_request_state=(
+                    recent_request_state
+                    if recent_request_state is not None
+                    else previous.recent_request_state if previous is not None else None
+                ),
+                request_correlations=tuple(correlations),
+                approval_candidates=(
+                    approval_candidates
+                    if approval_candidates is not None
+                    else previous.approval_candidates if previous is not None else ()
+                ),
             )
             state = self._sessions[session_id]
             state.trusted_result = context

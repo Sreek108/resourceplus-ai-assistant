@@ -18,9 +18,12 @@ export default function ChatMessage({
   const language = message.language || messageLanguage(message.text);
   const direction = messageDirection(message.text);
   const assistant = message.role === "assistant";
+  const structuredBlocks = Array.isArray(message.blocks) ? message.blocks : [];
+  const confirmationBlock = structuredBlocks.find((block) => block?.type === "confirmation");
+  const hasStructuredContent = assistant && structuredBlocks.length > 0;
 
   return (
-    <article className={`message-row ${message.role}`}>
+    <article className={`message-row ${message.role}${hasStructuredContent ? " has-structured-content" : ""}`}>
       {assistant && <div className="assistant-avatar" aria-hidden="true">R+</div>}
       <div className="message-stack">
         <div className="message-meta">
@@ -40,12 +43,16 @@ export default function ChatMessage({
           ) : (
             <span className="message-text">{message.text}</span>
           )}
-          {assistant && message.audioUrl && (
+          {assistant && (
             <button
               type="button"
               className="replay-button"
-              onClick={() => onReplay(message.audioUrl)}
-              aria-label="Replay assistant voice response"
+              onClick={() => onReplay(message)}
+              aria-label={
+                message.audioUrl
+                  ? "Replay assistant voice response"
+                  : "Read assistant message aloud"
+              }
             >
               <SpeakerIcon />
             </button>
@@ -56,6 +63,8 @@ export default function ChatMessage({
             blocks={message.needsReason ? message.blocks?.filter((block) => block.type !== "actions") : message.blocks}
             onAction={onActionSelect}
             actionsDisabled={busy || message.actionsActive === false}
+            direction={direction}
+            language={language}
           />
         )}
         {assistant && message.requiresConfirmation && (
@@ -63,6 +72,9 @@ export default function ChatMessage({
             onConfirm={onConfirm}
             onCancel={onCancel}
             disabled={busy}
+            block={confirmationBlock}
+            direction={direction}
+            language={language}
           />
         )}
         {assistant && message.needsReason && (

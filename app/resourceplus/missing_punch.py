@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime
 from typing import Any, Literal
 
@@ -35,6 +35,26 @@ class MissingPunchNormalization:
     @property
     def correctable_suggestions(self) -> tuple[MissingPunchRow, ...]:
         return tuple(row for row in self.rows if row.is_correctable)
+
+
+def apply_attendance_eligibility(
+    normalized: MissingPunchNormalization,
+    eligible_dates: set[date],
+) -> MissingPunchNormalization:
+    """Remove legacy correction availability unless v2 attendance agrees."""
+
+    return MissingPunchNormalization(
+        rows=tuple(
+            replace(
+                row,
+                is_correctable=(
+                    row.is_correctable and row.att_date in eligible_dates
+                ),
+            )
+            for row in normalized.rows
+        ),
+        invalid_row_count=normalized.invalid_row_count,
+    )
 
 
 def parse_missing_punch_date(value: object) -> date:

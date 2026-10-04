@@ -7,6 +7,12 @@ from app.ai import actions, tools as ai_tools
 from app.ai.actions import ActionIntent, execute_pending_action, prepare_write_action
 from app.ai.sessions import InMemorySessionStore
 from app.ai.tools import ALLOWED_TOOL_NAMES, TOOL_DEFINITIONS, DateRange, execute_tool
+from app.identity import (
+    RequestIdentity,
+    bind_request_identity,
+    current_request_identity,
+    reset_request_identity,
+)
 from app.models.schemas import ChatRequest
 from app.services import chat as chat_service
 
@@ -959,6 +965,152 @@ async def test_individual_supervisor_action_preserves_request_type(
     await execute_pending_action(intent.action_type, intent.validated_arguments)
     assert writes[0]["request_type"] == "ExceptionEntry"
     assert writes[0]["status"] == expected_status
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("verification_rows", "expected_result", "expected_message"),
+    [
+        ([], "approved", "Done — Talal Sabbagh's Work From Home request has been approved."),
+        (
+            [
+                {
+                    "requestId": "request-real",
+                    "requestType": "ExceptionEntry",
+                    "employeeName": "Talal Sabbagh",
+                    "detail": "Work From Home",
+                }
+            ],
+            "approval_pending_verification",
+            (
+                "The approval was accepted, but the request is still showing as "
+                "pending. I won't submit it again."
+            ),
+        ),
+    ],
+)
+async def test_supervisor_approval_is_verified_once_with_bound_identity(
+    monkeypatch,
+    verification_rows,
+    expected_result,
+    expected_message,
+) -> None:
+    identity = RequestIdentity("hana.haddad@example.com", "portalv21")
+    pending_reads: list[RequestIdentity] = []
+    writes: list[tuple[dict, RequestIdentity]] = []
+    action_states: list[dict] = []
+
+    async def pending(*args, **kwargs):
+        pending_reads.append(current_request_identity())
+        return verification_rows
+
+    async def approve(**kwargs):
+        writes.append((kwargs, current_request_identity()))
+        return {"success": True, "message": "Updated"}
+
+    monkeypatch.setattr(actions, "get_pending_approvals", pending)
+    monkeypatch.setattr(actions, "approve_supervisor_request", approve)
+    monkeypatch.setattr(
+        chat_service,
+        "record_action_state",
+        lambda **kwargs: action_states.append(kwargs),
+    )
+
+    store = InMemorySessionStore()
+    token = bind_request_identity(identity)
+    try:
+        session_id = store.ensure_session("verified-supervisor-approval")
+        action = store.create_pending_action(
+            session_id,
+            action_type="approve_supervisor_request",
+            validated_arguments={
+                "request_id": "request-real",
+                "request_type": "ExceptionEntry",
+                "status": 1,
+                "employee_name": "Talal Sabbagh",
+                "detail": "Work From Home",
+            },
+            summary="Approve Talal's Work From Home request?",
+            language="en",
+        )
+    finally:
+        reset_request_identity(token)
+
+    response = await chat_service.process_chat(
+        ChatRequest(
+            message="Yes",
+            session_id=session_id,
+            confirmation_id=action.confirmation_id,
+            email=identity.email,
+            instance=identity.instance,
+        ),
+        store=store,
+    )
+
+    assert response.success is True
+    assert response.message == expected_message
+    assert len(writes) == 1
+    assert writes[0][0] == {
+        "request_id": "request-real",
+        "request_type": "ExceptionEntry",
+        "status": 1,
+    }
+    assert writes[0][1] == identity
+    assert pending_reads == [identity]
+    assert action_states[-1]["state"] == "executed"
+    assert action_states[-1]["result"] == expected_result
+
+
+@pytest.mark.asyncio
+async def test_supervisor_approval_identity_mismatch_does_not_write_or_verify(
+    monkeypatch,
+) -> None:
+    writes: list[dict] = []
+    reads: list[bool] = []
+
+    async def approve(**kwargs):
+        writes.append(kwargs)
+        return {"success": True}
+
+    async def pending(*args, **kwargs):
+        reads.append(True)
+        return []
+
+    monkeypatch.setattr(actions, "approve_supervisor_request", approve)
+    monkeypatch.setattr(actions, "get_pending_approvals", pending)
+    store = InMemorySessionStore()
+    owner = RequestIdentity("hana.haddad@example.com", "portalv21")
+    token = bind_request_identity(owner)
+    try:
+        session_id = store.ensure_session("approval-owner-mismatch")
+        action = store.create_pending_action(
+            session_id,
+            action_type="approve_supervisor_request",
+            validated_arguments={
+                "request_id": "request-real",
+                "request_type": "ExceptionEntry",
+                "status": 1,
+            },
+            summary="Approve request?",
+            language="en",
+        )
+    finally:
+        reset_request_identity(token)
+
+    response = await chat_service.process_chat(
+        ChatRequest(
+            message="Yes",
+            session_id=session_id,
+            confirmation_id=action.confirmation_id,
+            email=owner.email,
+            instance="Universal",
+        ),
+        store=store,
+    )
+
+    assert response.success is False
+    assert writes == []
+    assert reads == []
 
 
 @pytest.mark.asyncio

@@ -4,6 +4,7 @@ from datetime import date, datetime
 from typing import Any
 
 from app.ai.reason_matcher import deterministic_reason_match, match_live_reason
+from app.resourceplus import ResourcePlusError
 from app.resourceplus.approvals import (
     approve_all_requests,
     approve_supervisor_request,
@@ -63,6 +64,58 @@ class LessHoursDay:
 class LessHoursInspection:
     days: tuple[LessHoursDay, ...]
     eligible_days: tuple[LessHoursDay, ...]
+    duplicate_guards: tuple["ExceptionalEntryGuard", ...] = ()
+    exceptional_entries_checked: bool = True
+
+    @property
+    def resolved_days(self) -> tuple["ResolvedLessHoursDay", ...]:
+        """Resolve display status and actionability from one per-date state."""
+
+        eligible_dates = {day.attendance_date for day in self.eligible_days}
+        guards_by_date: dict[date, ExceptionalEntryGuard] = {}
+        for guard in self.duplicate_guards:
+            current = guards_by_date.get(guard.attendance_date)
+            if current is None or guard.classification == "approved":
+                guards_by_date[guard.attendance_date] = guard
+
+        resolved: list[ResolvedLessHoursDay] = []
+        for day in self.days:
+            state = day.eligibility
+            if day.eligibility == "eligible":
+                guard = guards_by_date.get(day.attendance_date)
+                if guard is not None and guard.classification == "approved":
+                    state = "approved_exception"
+                elif guard is not None:
+                    state = "existing_request"
+                elif (
+                    self.exceptional_entries_checked
+                    and day.attendance_date in eligible_dates
+                ):
+                    state = "correction_available"
+                else:
+                    state = "correction_unavailable"
+            resolved.append(
+                ResolvedLessHoursDay(
+                    day=day,
+                    state=state,
+                    correction_available=state == "correction_available",
+                )
+            )
+        return tuple(resolved)
+
+
+@dataclass(frozen=True)
+class ExceptionalEntryGuard:
+    attendance_date: date
+    raw_status: str
+    classification: str
+
+
+@dataclass(frozen=True)
+class ResolvedLessHoursDay:
+    day: LessHoursDay
+    state: str
+    correction_available: bool
 
 
 class ActionResolutionRequired(Exception):
@@ -137,6 +190,19 @@ def _same_text(left: object, right: object) -> bool:
 
 def _normalized_key(value: object) -> str:
     return "".join(character for character in str(value).casefold() if character.isalnum())
+
+
+def bookable_day_type_group(value: object) -> str | None:
+    """Classify only ResourcePlus groups supported by leave/travel booking."""
+
+    normalized = _normalized_key(value)
+    if normalized in {"leave", "إجازة", "اجازة", "الإجازة", "الاجازة"}:
+        return "leave"
+    if normalized in {
+        "businesstravel", "travel", "مهمةعمل", "مهمةرسمية", "سفرعمل",
+    }:
+        return "business_travel"
+    return None
 
 
 def _normalized_words(value: object) -> tuple[str, ...]:
@@ -234,9 +300,44 @@ async def inspect_less_hours_period(
     end = _parse_resourceplus_date(str(date_to)) if not isinstance(date_to, date) else date_to
     if start > end:
         raise ValueError("date_from must be on or before date_to.")
-    rows = _attendance_rows(
-        await get_attendance_summary(start.isoformat(), end.isoformat(), lang=lang)
+    payload = await get_attendance_summary(start.isoformat(), end.isoformat(), lang=lang)
+    inspection = classify_attendance_summary(payload, start, end)
+    try:
+        exceptional_payload = await get_exceptional_entry_requests(
+            start,
+            end,
+            lang=lang,
+        )
+    except ResourcePlusError:
+        # Keep the attendance rows visible, but fail closed for write
+        # eligibility when the duplicate check is unavailable.
+        return LessHoursInspection(
+            days=inspection.days,
+            eligible_days=(),
+            exceptional_entries_checked=False,
+        )
+
+    guards = exceptional_entry_guards(exceptional_payload, start, end)
+    guarded_dates = {guard.attendance_date for guard in guards}
+    return LessHoursInspection(
+        days=inspection.days,
+        eligible_days=tuple(
+            day
+            for day in inspection.eligible_days
+            if day.attendance_date not in guarded_dates
+        ),
+        duplicate_guards=guards,
     )
+
+
+def classify_attendance_summary(
+    payload: Any,
+    date_from: date,
+    date_to: date,
+) -> LessHoursInspection:
+    """Classify trusted AttendanceSummary rows without performing another read."""
+
+    rows = _attendance_rows(payload)
     days: list[LessHoursDay] = []
     for row in rows:
         raw_date = _field(row, "AttDate", "attendanceDate", "date")
@@ -244,7 +345,7 @@ async def inspect_less_hours_period(
             attendance_date = _parse_resourceplus_date(raw_date)
         except ValueError:
             continue
-        if not start <= attendance_date <= end:
+        if not date_from <= attendance_date <= date_to:
             continue
         day_type_value = _field(row, "DayType", "dayType", "Status", "attendanceStatus")
         day_type = str(day_type_value).strip() if day_type_value not in (None, "") else "—"
@@ -277,6 +378,17 @@ async def inspect_less_hours_period(
     )
 
 
+def _attendance_snapshot(day: LessHoursDay) -> dict[str, object]:
+    return {
+        "day_type": day.day_type,
+        "check_in": day.check_in,
+        "check_out": day.check_out,
+        "worked_hours": day.worked_hours,
+        "less_hours": day.less_hours,
+        "eligibility": day.eligibility,
+    }
+
+
 def _exceptional_request_rows(payload: Any) -> list[dict[str, Any]]:
     if isinstance(payload, list):
         return [row for row in payload if isinstance(row, dict)]
@@ -286,6 +398,103 @@ def _exceptional_request_rows(payload: Any) -> list[dict[str, Any]]:
             if isinstance(value, list):
                 return [row for row in value if isinstance(row, dict)]
     return []
+
+
+def exceptional_entry_guards(
+    payload: Any,
+    date_from: date,
+    date_to: date,
+) -> tuple[ExceptionalEntryGuard, ...]:
+    """Identify only statuses that safely prevent offering a duplicate.
+
+    ResourcePlus has not documented whether ``Not Approved`` means pending or
+    rejected. It is retained verbatim and classified only as ambiguous.
+    """
+
+    guards: list[ExceptionalEntryGuard] = []
+    for row in _exceptional_request_rows(payload):
+        raw_date = _field(
+            row,
+            "entryTime",
+            "attDate",
+            "attendanceDate",
+            "date",
+            "requestDate",
+        )
+        try:
+            attendance_date = _parse_resourceplus_date(raw_date)
+        except ValueError:
+            continue
+        if not date_from <= attendance_date <= date_to:
+            continue
+        status_value = _field(row, "status", "requestStatus")
+        if not isinstance(status_value, str) or not status_value.strip():
+            continue
+        raw_status = status_value.strip()
+        normalized = _normalized_key(raw_status)
+        if normalized == "approved":
+            classification = "approved"
+        elif normalized == "notapproved":
+            classification = "ambiguous_not_approved"
+        else:
+            continue
+        guards.append(
+            ExceptionalEntryGuard(
+                attendance_date=attendance_date,
+                raw_status=raw_status,
+                classification=classification,
+            )
+        )
+    return tuple(guards)
+
+
+def less_hours_duplicate_guard_message(
+    inspection: LessHoursInspection,
+    attendance_date: date,
+    language: str,
+) -> str | None:
+    if not inspection.exceptional_entries_checked:
+        if language == "ar":
+            return (
+                "ما قدرت أتحقق من طلبات التصحيح الحالية، لذلك ما راح أبدأ تصحيح "
+                "جديد قد يكون مكرر."
+            )
+        return (
+            "I couldn't check your existing correction requests, so I won't start "
+            "another one that might be a duplicate."
+        )
+    matching_guards = [
+        item for item in inspection.duplicate_guards
+        if item.attendance_date == attendance_date
+    ]
+    guard = next(
+        (item for item in matching_guards if item.classification == "approved"),
+        matching_guards[0] if matching_guards else None,
+    )
+    if guard is None:
+        return None
+    displayed_date = attendance_date.isoformat()
+    if guard.classification == "approved":
+        if language == "ar":
+            return (
+                f"يوم {displayed_date} مغطى بالفعل بتصحيح حضور معتمد، "
+                "لذلك ما فيه شيء آخر يحتاج إرسال."
+            )
+        return (
+            f"{attendance_date.strftime('%b')} {attendance_date.day} is already "
+            "covered by an approved attendance correction, so there's nothing else "
+            "to submit."
+        )
+    if language == "ar":
+        return (
+            f"فيه طلب تصحيح موجود ليوم {displayed_date}، فما راح أبدأ طلب ثاني. "
+            f"حالته الظاهرة «{guard.raw_status}» وما نقدر نعتبرها موافقة أو رفض."
+        )
+    return (
+        f"There's already a correction request for {displayed_date}, so I won't "
+        f'create another one. Its status is "{guard.raw_status}"; that does not '
+        "tell us whether it is pending or rejected."
+    )
 
 
 def _is_cancellable_exception(row: dict[str, Any]) -> bool:
@@ -547,38 +756,33 @@ def _confirmation_summary(
         if language == "ar":
             arabic_direction = "دخول" if direction == "IN" else "خروج"
             return (
-                "إرسال طلب إدخال استثنائي للبيانات التالية:\n\n"
+                "تقدر ترسل طلب تصحيح البصمة بالتفاصيل التالية:\n\n"
                 f"التاريخ: {entry_time.strftime('%d/%m/%Y')}\n"
                 f"البصمة: {arabic_direction}\n"
                 f"الوقت المقترح: {entry_time.strftime('%H:%M')}\n"
                 f"السبب: {values['reason_name']}\n\n"
-                "هل ترغب في إرسال الطلب؟ التأكيد مطلوب."
+                "تبغى ترسل الطلب؟"
             )
         return (
-            f"ResourcePlus suggests correcting the {direction} punch on "
+            f"I found a suggested {direction} punch correction for "
             f"{_format_date(entry_time.date())} to {_format_time(entry_time)}. "
-            f"Reason: {values['reason_name']}. Submit this exceptional-entry request? "
-            "Confirmation is required."
+            f"Reason: {values['reason_name']}. Submit this attendance correction?"
         )
     if action_type == "create_exceptional_entry_from_summary":
         side = values.get("entry_type")
         side_text = (
-            "late IN only"
+            "IN-side"
             if side == 1
-            else "early OUT only"
+            else "OUT-side"
             if side == 2
             else None
         )
-        details = [f"Date: {values['att_date']}"]
-        if "minutes" in values:
-            details.append(f"Requested minutes: {values['minutes']}")
-        if side_text is not None:
-            details.append(f"Scope: {side_text}")
-        details.extend(
-            [
-                f"Reason: {values['reason_name']}",
-                f"Missing duration: {values['less_hours']}",
-            ]
+        requested_minutes = values.get("minutes")
+        if not isinstance(requested_minutes, int):
+            requested_minutes = _duration_minutes(values.get("less_hours"))
+        target = _parse_resourceplus_date(values["att_date"])
+        duration = (
+            f"{requested_minutes}-minute " if requested_minutes is not None else ""
         )
         if language == "ar":
             arabic_side = (
@@ -587,6 +791,15 @@ def _confirmation_summary(
                 else "الخروج المبكر فقط"
                 if side == 2
                 else None
+            )
+            arabic_duration = (
+                f"لمدة {requested_minutes} دقيقة "
+                if requested_minutes is not None else ""
+            )
+            arabic_scope = f" ({arabic_side})" if arabic_side is not None else ""
+            confirmation = (
+                f"للتأكيد: أرسل تصحيح حضور {arabic_duration}ليوم "
+                f"{target.isoformat()} بسبب {values['reason_name']}{arabic_scope}؟"
             )
             arabic_details = [
                 f"التاريخ: {values['att_date']}",
@@ -597,27 +810,80 @@ def _confirmation_summary(
                 arabic_details.append(f"النطاق: {arabic_side}")
             if "minutes" in values:
                 arabic_details.append(f"الدقائق المطلوبة: {values['minutes']}")
-            return "تصحيح الساعات الناقصة:\n\n" + "\n".join(arabic_details) + "\n\nالتأكيد مطلوب قبل الإرسال."
-        return "Correct the missing hours with these details:\n\n" + "\n".join(details) + "\n\nConfirmation is required before submission."
+            return confirmation + "\n\n" + "\n".join(arabic_details)
+        scope = f" {side_text}" if side_text is not None else ""
+        confirmation = (
+            f"Just to confirm: submit a {duration}attendance correction for "
+            f"{target.strftime('%b')} {target.day} for {values['reason_name']}{scope}?"
+        )
+        details = [
+            f"Date: {values['att_date']}",
+            f"Missing duration: {values['less_hours']}",
+            f"Reason: {values['reason_name']}",
+        ]
+        if side_text is not None:
+            details.append(f"Scope: {'late IN only' if side == 1 else 'early OUT only'}")
+        if "minutes" in values:
+            details.append(f"Requested minutes: {values['minutes']}")
+        return confirmation + "\n\n" + "\n".join(details)
     if action_type == "cancel_exceptional_entry":
         if language == "ar":
-            return f"إلغاء طلب الإدخال الاستثنائي: {values['display']}. التأكيد مطلوب."
+            return f"تبغى تلغي طلب تصحيح الحضور: {values['display']}؟"
         return (
-            f"Cancel this exceptional-entry request: {values['display']}. "
-            "Confirmation is required."
+            f"Cancel this attendance correction request: {values['display']}?"
         )
     if action_type == "book_day_type":
-        return (
-            f"Submit {values['day_type_name']} from {values['date_from']} through "
-            f"{values['date_to']}. Confirmation is required."
+        start = date.fromisoformat(str(values["date_from"]))
+        end = date.fromisoformat(str(values["date_to"]))
+        if language == "ar":
+            period = (
+                f"يوم {start.isoformat()}" if start == end
+                else f"من {start.isoformat()} إلى {end.isoformat()}"
+            )
+            return f"أنت على وشك طلب {values['day_type_name']} {period}. هل تريد إرساله؟"
+        period = (
+            f"on {start.day} {start.strftime('%B')} {start.year}"
+            if start == end
+            else (
+                f"from {start.day} {start.strftime('%B')} {start.year} "
+                f"to {end.day} {end.strftime('%B')} {end.year}"
+            )
         )
+        return f"You're about to apply for {values['day_type_name']} {period}. Submit it?"
     if action_type == "cancel_day_type_request":
         return f"Cancel this request: {values['display']}. Confirmation is required."
     if action_type == "approve_supervisor_request":
         verb = "approve" if values["status"] == 1 else "reject"
+        category = str(values.get("category") or "Request")
+        detail = str(values.get("detail") or "request")
+        request_date = values.get("request_date")
+        date_label = ""
+        if isinstance(request_date, str) and request_date.strip():
+            try:
+                parsed_date = _parse_resourceplus_date(request_date)
+                date_label = (
+                    parsed_date.isoformat()
+                    if language == "ar"
+                    else f"{parsed_date.strftime('%b')} {parsed_date.day}"
+                )
+            except ValueError:
+                date_label = request_date.strip()
+        if language == "ar":
+            arabic_verb = "الموافقة على" if verb == "approve" else "رفض"
+            arabic_date = f" ليوم {date_label}" if date_label else ""
+            return (
+                f"تأكيد {arabic_verb} طلب {detail} الخاص بـ"
+                f"{values['employee_name']}{arabic_date}؟"
+            )
+        date_text = f" for {date_label}" if date_label else ""
+        request_text = (
+            f"{detail} attendance correction"
+            if category == "Attendance correction"
+            else f"{detail} request"
+        )
         return (
-            f"{verb.capitalize()} {values['employee_name']}'s request: "
-            f"{values['detail']}. Confirmation is required."
+            f"{verb.capitalize()} {values['employee_name']}'s {request_text}"
+            f"{date_text}?"
         )
     if action_type == "update_notification_read_status":
         state = "read" if values["read_status"] == 1 else "unread"
@@ -637,6 +903,16 @@ def _confirmation_summary(
         f"You currently have {count} pending {scope} requests. This will {verb} all "
         f"{count}. Confirmation is required."
     )
+
+
+def confirmation_summary(
+    action_type: str,
+    values: dict[str, object],
+    language: str,
+) -> str:
+    """Re-render an immutable pending action in the current response language."""
+
+    return _confirmation_summary(action_type, values, language)
 
 
 async def _prepare_exceptional_entry(
@@ -887,13 +1163,13 @@ def _less_hours_not_eligible_message(day: LessHoursDay, language: str) -> str:
     if day.eligibility == "no_punches":
         if language == "ar":
             return (
-                "لا توجد لديك بصمات حضور لهذا اليوم، لذلك لا يمكن "
-                "تصحيحه كساعات ناقصة. يمكنني مساعدتك في طلب إجازة أو مهمة عمل بدلاً من ذلك."
+                f"لا توجد بصمات حضور في {day.attendance_date.isoformat()}، لذلك لا يمكن "
+                "تصحيح هذا اليوم كإدخال استثنائي. يمكنك طلب إجازة أو مهمة عمل بدلاً من ذلك."
             )
         return (
-            "You do not have attendance punches for that day, so it cannot "
-            "be corrected as a less-hours entry. I can help you apply for Leave "
-            "or Business Travel instead."
+            f"I don't see any attendance punches for {_format_date(day.attendance_date)}, "
+            "so this can't be corrected as an exceptional entry. You can apply for "
+            "Leave or Business Travel for that day instead."
         )
     labels = {
         "week_end": "a week end",
@@ -946,10 +1222,20 @@ async def _prepare_less_hours_correction(
     matching_days = [day for day in inspection.days if day.attendance_date == target_date]
     if not matching_days:
         raise ActionResolutionRequired(
-            "ResourcePlus returned no attendance row for that date.",
+            "I couldn't find an attendance entry for that date.",
             category="attendance_not_found",
         )
     selected = matching_days[0]
+    duplicate_message = less_hours_duplicate_guard_message(
+        inspection,
+        target_date,
+        response_language,
+    )
+    if duplicate_message is not None:
+        raise ActionResolutionRequired(
+            duplicate_message,
+            category="existing_exceptional_entry",
+        )
     if selected.eligibility != "eligible":
         raise ActionResolutionRequired(
             _less_hours_not_eligible_message(selected, response_language),
@@ -1008,6 +1294,7 @@ async def _prepare_less_hours_correction(
         "reason_name": selected_reason_name,
         "remarks": remarks.strip(),
         "less_hours": selected.less_hours,
+        "attendance_snapshot": _attendance_snapshot(selected),
     }
     if entry_type is not None:
         internal["entry_type"] = entry_type
@@ -1130,6 +1417,11 @@ async def _prepare_book_day_type(
     ]
     if len(matches) != 1:
         raise ValueError("The selected day type does not match a ResourcePlus day type.")
+    requested_group = arguments.get("_booking_group")
+    if requested_group is not None:
+        group = bookable_day_type_group(matches[0].get("group"))
+        if group is None or requested_group not in {group, "leave_or_travel"}:
+            raise ValueError("The selected day type is not available for this leave or travel request.")
     day_type_id = matches[0].get("dayID")
     if isinstance(day_type_id, bool) or not isinstance(day_type_id, int):
         raise ValueError("ResourcePlus returned an invalid day type ID.")
@@ -1228,6 +1520,9 @@ async def _prepare_supervisor_request(
     employee_name = arguments.get("employee_name")
     detail = arguments.get("detail")
     decision = arguments.get("decision")
+    trusted_request_id = arguments.get("request_id")
+    trusted_request_type = arguments.get("request_type")
+    use_trusted_selector = arguments.get("_trusted_selector") is True
     if not isinstance(employee_name, str) or not employee_name.strip():
         raise ValueError("The employee name is required.")
     if detail is not None and not isinstance(detail, str):
@@ -1241,23 +1536,75 @@ async def _prepare_supervisor_request(
     )
     matches = []
     for item in approvals:
-        if not _same_text(item.get("employeeName"), employee_name):
-            continue
-        if detail and not _same_text(item.get("detail"), detail):
+        if use_trusted_selector:
+            if not (
+                isinstance(trusted_request_id, str)
+                and isinstance(trusted_request_type, str)
+                and str(item.get("requestId")) == trusted_request_id
+                and str(item.get("requestType")) == trusted_request_type
+            ):
+                continue
+        else:
+            if not _same_text(item.get("employeeName"), employee_name):
+                continue
+            if detail and not _same_text(item.get("detail"), detail):
+                continue
+        live_status = str(item.get("status") or "").strip().casefold()
+        if live_status in {"approved", "rejected", "cancelled", "canceled"}:
             continue
         if item.get("requestId") and item.get("requestType"):
             matches.append(item)
+    if not matches and use_trusted_selector:
+        message = (
+            "ما قدرت ألقى طلب الموافقة المعلّق الذي تقصده."
+            if response_language == "ar"
+            else "I couldn't find that pending request."
+        )
+        raise ActionResolutionRequired(
+            message,
+            category="pending_request_unavailable",
+        )
     if len(matches) != 1:
         raise ValueError("No single matching pending supervisor request was found.")
 
     selected = matches[0]
+    live_detail = str(
+        _field(selected, "detail", "description", "dayType", "reasonName")
+        or detail
+        or "request"
+    )
+    normalized_type = re.sub(
+        r"[^a-z]", "", str(selected.get("requestType", "")).casefold()
+    )
+    category = (
+        "Attendance correction"
+        if normalized_type in {"exceptionentry", "exceptionalentry"}
+        else "Business Travel"
+        if normalized_type in {"absence", "leave", "daytype"}
+        and "business travel" in live_detail.casefold()
+        else "Leave"
+        if normalized_type in {"absence", "leave", "daytype"}
+        else str(selected.get("requestType") or "Request")
+    )
     internal = {
         "request_id": str(selected["requestId"]),
         "request_type": str(selected["requestType"]),
         "status": 1 if decision == "approve" else 2,
         "employee_name": str(selected.get("employeeName", employee_name)),
-        "detail": str(selected.get("detail", "request")),
+        "detail": live_detail,
+        "category": category,
+        "approval_snapshot_verified": True,
     }
+    request_date = _field(
+        selected,
+        "date",
+        "dateFrom",
+        "AttDate",
+        "attendanceDate",
+        "requestDate",
+    )
+    if request_date not in (None, ""):
+        internal["request_date"] = str(request_date)
     return ActionIntent(
         "approve_supervisor_request",
         internal,
@@ -1422,6 +1769,107 @@ async def prepare_write_action(
     raise ValueError("Unsupported write action.")
 
 
+async def revalidate_pending_action(
+    action_type: str,
+    arguments: dict[str, object],
+    *,
+    lang: int,
+    response_language: str,
+) -> None:
+    """Revalidate new v2 correction state immediately before its one-shot write."""
+
+    if (
+        action_type == "approve_supervisor_request"
+        and arguments.get("approval_snapshot_verified") is True
+    ):
+        pending = _require_list(
+            await get_pending_approvals(lang=lang),
+            "pending approvals",
+        )
+        request_id = str(arguments.get("request_id") or "")
+        request_type = str(arguments.get("request_type") or "")
+        still_pending = any(
+            str(item.get("requestId")) == request_id
+            and str(item.get("requestType")) == request_type
+            and str(item.get("status") or "").strip().casefold()
+            not in {"approved", "rejected", "cancelled", "canceled"}
+            for item in pending
+        )
+        if not still_pending:
+            message = (
+                "هذا الطلب لم يعد موجودًا ضمن الموافقات المعلقة، لذلك ما تم إرسال أي إجراء."
+                if response_language == "ar"
+                else (
+                    "That request is no longer in your pending approvals, so nothing "
+                    "was submitted."
+                )
+            )
+            raise ActionResolutionRequired(
+                message,
+                category="pending_request_changed",
+            )
+        return
+    if action_type != "create_exceptional_entry_from_summary":
+        return
+    stored_snapshot = arguments.get("attendance_snapshot")
+    # In-memory actions created before this field existed cannot survive a process
+    # restart. The compatibility branch is retained for directly constructed tests.
+    if not isinstance(stored_snapshot, dict):
+        return
+    try:
+        target_date = date.fromisoformat(str(arguments["att_date"]))
+    except (KeyError, ValueError) as exc:
+        raise ValueError("The stored correction date is invalid.") from exc
+
+    inspection = await inspect_less_hours_period(target_date, target_date, lang=lang)
+    matching = [day for day in inspection.days if day.attendance_date == target_date]
+    selected = matching[0] if matching else None
+    duplicate_message = less_hours_duplicate_guard_message(
+        inspection,
+        target_date,
+        response_language,
+    )
+    if duplicate_message is not None:
+        raise ActionResolutionRequired(
+            duplicate_message,
+            category="existing_exceptional_entry",
+        )
+    current_snapshot = _attendance_snapshot(selected) if selected is not None else None
+    if (
+        selected is None
+        or selected.eligibility != "eligible"
+        or current_snapshot != stored_snapshot
+    ):
+        message = (
+            "تغيّرت بيانات الحضور منذ إعداد التصحيح. لم يتم إرسال الطلب؛ راجع "
+            "بيانات الحضور وابدأ التصحيح من جديد."
+            if response_language == "ar"
+            else (
+                "Your attendance changed after this correction was prepared. Nothing "
+                "was submitted; review the attendance entry and start again."
+            )
+        )
+        raise ActionResolutionRequired(message, category="attendance_changed")
+
+    stored_reason_id = arguments.get("reason_id")
+    stored_reason_name = arguments.get("reason_name")
+    live_reasons = await _live_exception_reasons(lang)
+    reason_is_live = any(
+        reason_id == stored_reason_id and reason_name == stored_reason_name
+        for reason_id, reason_name in live_reasons
+    )
+    if not reason_is_live:
+        message = (
+            "تغيّرت أسباب التصحيح المتاحة. لم يتم إرسال الطلب؛ ابدأ التصحيح من جديد."
+            if response_language == "ar"
+            else (
+                "The available correction reasons changed. Nothing was submitted; "
+                "start the correction again."
+            )
+        )
+        raise ActionResolutionRequired(message, category="reason_changed")
+
+
 async def execute_pending_action(action_type: str, arguments: dict[str, object]) -> Any:
     """Execute only backend-stored validated arguments after confirmation."""
 
@@ -1455,17 +1903,67 @@ async def execute_pending_action(action_type: str, arguments: dict[str, object])
     if action_type == "cancel_day_type_request":
         return await cancel_day_type_request(str(arguments["mapping_id"]))
     if action_type == "approve_supervisor_request":
-        return await approve_supervisor_request(
+        result = await approve_supervisor_request(
             request_id=str(arguments["request_id"]),
             request_type=str(arguments["request_type"]),
             status=int(arguments["status"]),
         )
+        if not isinstance(result, dict) or result.get("success") is not True:
+            return result
+
+        verified_result = dict(result)
+        verified_result["_approval_status"] = int(arguments["status"])
+        try:
+            pending = _require_list(
+                await get_pending_approvals(),
+                "pending approvals",
+            )
+        except (ResourcePlusError, ValueError):
+            verified_result["_approval_verification"] = "unavailable"
+            return verified_result
+        request_id = str(arguments["request_id"])
+        request_type = str(arguments["request_type"])
+        still_pending = any(
+            str(item.get("requestId")) == request_id
+            and str(item.get("requestType")) == request_type
+            for item in pending
+            if item.get("requestId") not in (None, "")
+        )
+        verified_result["_approval_verification"] = (
+            "still_pending" if still_pending else "verified"
+        )
+        verified_result["_remaining_pending_approvals"] = pending
+        return verified_result
     if action_type == "approve_all_requests":
         request_type = arguments.get("request_type")
-        return await approve_all_requests(
+        result = await approve_all_requests(
             status=int(arguments["status"]),
             request_type=str(request_type) if request_type is not None else None,
         )
+        if not isinstance(result, dict) or result.get("success") is not True:
+            return result
+        verified_result = dict(result)
+        try:
+            pending = _require_list(
+                await get_pending_approvals(),
+                "pending approvals",
+            )
+        except (ResourcePlusError, ValueError):
+            verified_result["_bulk_approval_verification"] = "unavailable"
+            return verified_result
+        remaining = (
+            pending
+            if request_type is None
+            else [
+                item for item in pending
+                if item.get("requestType") == str(request_type)
+            ]
+        )
+        verified_result["_bulk_approval_verification"] = (
+            "verified" if not remaining else "still_pending"
+        )
+        verified_result["_verified_count"] = int(arguments.get("count", 0))
+        return verified_result
     if action_type == "update_notification_read_status":
         return await update_notification_read_status(
             notifcn_id=int(arguments["notifcn_id"]),

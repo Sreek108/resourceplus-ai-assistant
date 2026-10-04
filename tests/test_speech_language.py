@@ -1,6 +1,12 @@
 import pytest
 
-from app.speech.language import detect_text_language, resolve_spoken_language
+from app.speech.language import (
+    analyze_script,
+    content_matches_language,
+    detect_text_language,
+    resolve_session_language,
+    resolve_spoken_language,
+)
 
 
 @pytest.mark.parametrize(
@@ -51,4 +57,57 @@ def test_typed_text_reuses_script_based_detection() -> None:
     assert detect_text_language("Show 2 notifications") == "en"
     assert detect_text_language("عندي ٢ تنبيهات") == "ar"
     assert detect_text_language("أبغى أشوف attendance حقي") == "ar"
+
+
+def test_short_voice_turn_keeps_last_confident_language_and_ignores_raw_locale() -> None:
+    resolution = resolve_session_language(
+        "Yes",
+        last_confident_language="en",
+        fallback="ar",
+    )
+
+    assert resolution.language == "en"
+    assert resolution.source == "last_confident_language"
+    assert resolution.short_utterance is True
+    assert resolution.last_confident_language == "en"
+
+
+@pytest.mark.parametrize(
+    ("transcript", "established", "expected"),
+    [
+        ("Continue in Arabic", "en", "ar"),
+        ("خلينا نكمل بالعربي", "en", "ar"),
+        ("Continue in English", "ar", "en"),
+        ("خلينا نكمل بالإنجليزي", "ar", "en"),
+    ],
+)
+def test_explicit_language_switch_overrides_session_language(
+    transcript: str,
+    established: str,
+    expected: str,
+) -> None:
+    resolution = resolve_session_language(
+        transcript,
+        last_confident_language=established,
+    )
+
+    assert resolution.language == expected
+    assert resolution.source == "explicit_language_switch"
+    assert resolution.last_confident_language == expected
+
+
+def test_materially_mixed_transcript_is_ambiguous_evidence() -> None:
+    analysis = analyze_script("Hay resource بلس.")
+
+    assert analysis.classification == "mixed"
+    assert analysis.latin_letters > analysis.arabic_letters > 0
+
+
+def test_response_language_validation_catches_clear_opposite_script() -> None:
+    assert content_matches_language("Your attendance is ready.", "en") is True
+    assert content_matches_language("حضورك جاهز.", "ar") is True
+    assert content_matches_language("حضورك جاهز.", "en") is False
+    assert content_matches_language("Your attendance is ready.", "ar") is False
+    assert content_matches_language("OK", "ar") is False
+    assert content_matches_language("تم", "en") is False
 

@@ -12,6 +12,7 @@ from app.resourceplus.missing_punch import (
     normalize_missing_punch_suggestions,
     parse_missing_punch_date,
 )
+from app.services.response_blocks import missing_punch_block
 
 
 SEPTEMBER_FIRST_IN = {
@@ -353,3 +354,66 @@ def test_normalizer_separates_missing_punches_from_correctable_suggestions() -> 
         row.is_correctable is False for row in normalized.missing_punches[1:]
     )
     assert normalized.invalid_row_count == 3
+
+
+def test_missing_punch_block_maps_normalized_resourceplus_fields() -> None:
+    normalized = missing_punch_tool_data(
+        normalize_missing_punch_suggestions([SEPTEMBER_FIRST_IN])
+    )
+
+    block = missing_punch_block(normalized)
+
+    assert block.rows == [
+        {
+            "date": "01/09/2026",
+            "direction": "IN",
+            "suggested": "09:00",
+            "correctable": True,
+        }
+    ]
+
+
+def test_missing_punch_block_does_not_invent_unavailable_values() -> None:
+    block = missing_punch_block(
+        {
+            "missing_punches_by_date": [
+                {
+                    "att_date": None,
+                    "missing_punches": [
+                        {
+                            "entry_type": "OUT",
+                            "suggested_entry_time": None,
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+
+    assert block.rows == [
+        {
+            "date": None,
+            "direction": "OUT",
+            "suggested": None,
+            "correctable": None,
+        }
+    ]
+
+
+def test_missing_punch_block_preserves_false_when_suggested_time_is_unavailable() -> None:
+    normalized = missing_punch_tool_data(
+        normalize_missing_punch_suggestions(
+            [{**SEPTEMBER_FIRST_IN, "suggestedEntryTime": ""}]
+        )
+    )
+
+    block = missing_punch_block(normalized)
+
+    assert block.rows == [
+        {
+            "date": "01/09/2026",
+            "direction": "IN",
+            "suggested": None,
+            "correctable": False,
+        }
+    ]

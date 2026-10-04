@@ -496,9 +496,20 @@ def _write_intent_is_grounded(tool_name: str, message: str) -> bool:
             and any(cue in normalized for cue in ("إجاز", "اجاز", "طلب", "سفر", "غياب"))
         )
 
-    if tool_name in {"prepare_supervisor_request", "prepare_approve_all_requests"}:
+    if tool_name == "prepare_supervisor_request":
         return bool(re.search(r"\b(?:approve|reject)\b", normalized)) or any(
             cue in normalized for cue in ("وافق", "موافقة", "ارفض", "رفض")
+        )
+
+    if tool_name == "prepare_approve_all_requests":
+        return bool(
+            re.search(
+                r"\b(?:approve|reject)\s+(?:everything|all(?:\s+pending)?(?:\s+requests?)?)\b",
+                normalized,
+            )
+        ) or (
+            any(cue in normalized for cue in ("وافق", "موافقة", "ارفض", "رفض"))
+            and any(cue in normalized for cue in ("الكل", "جميع", "كل الطلبات"))
         )
 
     if tool_name == "prepare_notification_read_status":
@@ -593,6 +604,34 @@ def resolve_relative_date_range(
         return DateRange(selected, end.replace(day=1), end)
     if selected == "this_month":
         return DateRange(selected, current.replace(day=1), current)
+
+    month_names = {
+        "january": 1, "jan": 1, "february": 2, "feb": 2,
+        "march": 3, "mar": 3, "april": 4, "apr": 4, "may": 5,
+        "june": 6, "jun": 6, "july": 7, "jul": 7, "august": 8,
+        "aug": 8, "september": 9, "sep": 9, "sept": 9,
+        "october": 10, "oct": 10, "november": 11, "nov": 11,
+        "december": 12, "dec": 12,
+        "يناير": 1, "فبراير": 2, "مارس": 3, "أبريل": 4, "ابريل": 4,
+        "مايو": 5, "يونيو": 6, "يوليو": 7, "أغسطس": 8, "اغسطس": 8,
+        "سبتمبر": 9, "أكتوبر": 10, "اكتوبر": 10, "نوفمبر": 11,
+        "ديسمبر": 12,
+    }
+    month_pattern = "|".join(
+        sorted((re.escape(name) for name in month_names), key=len, reverse=True)
+    )
+    named = re.search(
+        rf"(?<!\w)({month_pattern})(?:\s+(20\d{{2}}))?(?!\w)",
+        normalized,
+        re.I,
+    )
+    if named is not None:
+        month = month_names[named.group(1).casefold()]
+        year = int(named.group(2) or current.year)
+        start = date(year, month, 1)
+        month_end = date(year, month, monthrange(year, month)[1])
+        end = current if year == current.year and month == current.month else month_end
+        return DateRange("named_month", start, end)
     return None
 
 

@@ -3,6 +3,12 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, Field, PrivateAttr, field_validator
 
 
+class ApprovalSelection(BaseModel):
+    kind: Literal["pending_approval"] = "pending_approval"
+    decision: Literal["approve", "reject"]
+    ordinal: int = Field(ge=1, le=500)
+
+
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=4_000)
     lang: int | None = Field(default=None, ge=1)
@@ -10,6 +16,7 @@ class ChatRequest(BaseModel):
     email: str | None = None
     instance: str | None = None
     confirmation_id: str | None = Field(default=None, min_length=1, max_length=128)
+    approval_selection: ApprovalSelection | None = None
 
     @field_validator("message")
     @classmethod
@@ -39,6 +46,7 @@ class BlockAction(BaseModel):
     label: str
     value: str
     style: Literal["primary", "secondary", "danger"] = "secondary"
+    payload: ApprovalSelection | None = None
 
 
 class TableBlock(BaseModel):
@@ -46,6 +54,7 @@ class TableBlock(BaseModel):
     title: str
     columns: list[BlockColumn]
     rows: list[dict[str, str | int | float | bool | None]]
+    row_actions: list[list[BlockAction]] = Field(default_factory=list)
 
 
 class KeyValueBlock(BaseModel):
@@ -121,6 +130,15 @@ class ChatResponse(BaseModel):
     def model_post_init(self, __context: object) -> None:
         if self.display_message is None:
             self.display_message = self.message
+        self.blocks = [
+            block
+            for block in self.blocks
+            if not (
+                (block.type == "table" and not block.rows)
+                or (block.type in {"key_value", "stat_cards", "list"} and not block.items)
+                or (block.type == "actions" and not block.actions)
+            )
+        ]
 
     @property
     def speech_message(self) -> str | None:
@@ -137,6 +155,19 @@ class VoiceChatResponse(ChatResponse):
     detected_locale: str
     audio_base64: str
     audio_mime_type: str
+
+
+class SpeechSynthesisRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=8_000)
+    language: Literal["en", "ar"]
+
+
+class SpeechSynthesisResponse(BaseModel):
+    audio_base64: str
+    audio_mime_type: str
+    language: Literal["en", "ar"]
+    tts_locale: str
+    tts_voice: str
 
 
 class ErrorResponse(BaseModel):
